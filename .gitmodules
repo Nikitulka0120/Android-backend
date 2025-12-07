@@ -1,0 +1,3 @@
+[submodule "Android-project"]
+	path = Android-project
+	url = https://github.com/Nikitulka0120/Android-project.git
