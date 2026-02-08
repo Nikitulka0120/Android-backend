@@ -25,9 +25,9 @@ def print_all_data():
 
 context = zmq.Context()
 socket = context.socket(zmq.REP)
-socket.bind("tcp://0.0.0.0:5555") 
+socket.bind("tcp://0.0.0.0:7777") 
     
-print(f"Server started on port 5555. Saving data to '{LOG_FILE}'...")
+print(f"Server started on port 7777. Saving data to '{LOG_FILE}'...")
 print("Press Ctrl+C to stop the server and view logs.")
 
 packet_count = 0
