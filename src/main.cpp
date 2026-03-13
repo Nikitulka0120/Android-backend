@@ -5,6 +5,7 @@
 #include <fstream>
 #include <mutex>
 #include <vector>
+#include <ctime>
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
@@ -38,6 +39,7 @@ struct Telemetry
     std::string lat = "0", lon = "0", alt = "0", acc = "0", type = "N/A";
     float current_rsrp = -140.0f;
     SignalHistory history;
+    std::vector<std::string> pending_records; 
 } data_store;
 
 std::mutex mtx;
@@ -51,7 +53,6 @@ bool get_network = true;
 
 // переменные по приколу
 int session_data_counter = 0;
-
 
 std::string get_json_value(const std::string &json, const std::string &key)
 {
@@ -74,6 +75,16 @@ std::string get_json_value(const std::string &json, const std::string &key)
     return "";
 }
 
+void flush_to_disk() {
+    if (data_store.pending_records.empty()) return;
+    std::ofstream file("log.json", std::ios::app);
+    if (file.is_open()) {
+        for (const auto& r : data_store.pending_records) file << r << "\n";
+        file.close();
+    }
+    data_store.pending_records.clear();
+}
+
 // Сервер
 void run_server()
 {
@@ -91,8 +102,9 @@ void run_server()
         return;
     }
 
-    while (start_server)
+    while (running)
     {
+        if (!start_server) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
         zmq::message_t request;
         if (socket.recv(request, zmq::recv_flags::none))
         {
@@ -122,20 +134,21 @@ void run_server()
                         data_store.current_rsrp = std::stof(s_val);
                         data_store.history.add_point(data_store.current_rsrp);
                     }
-                    catch (...)
-                    {
-                    }
+                    catch (...) {}
                 }
 
                 log_messages.push_back("[" + data_store.type + "] RSRP: " + s_val);
                 if (log_messages.size() > 50)
                     log_messages.erase(log_messages.begin());
+                data_store.pending_records.push_back(msg);
+                if (data_store.pending_records.size() >= 10) flush_to_disk();
             }
             session_data_counter++;
             socket.send(zmq::buffer(std::string("OK")), zmq::send_flags::none);
         }
     }
-    session_data_counter = 0;
+    std::lock_guard<std::mutex> lock(mtx);
+    flush_to_disk();
 }
 
 void ColoredIndicator(const char* label, bool condition, const char* true_text = "ON", const char* false_text = "OFF") {
@@ -195,8 +208,6 @@ void run_gui()
         ImGui::Text("Data counter\n in this session: %d", session_data_counter);
         ImGui::End();
 
-
-        
         // Окно checkboxov
         ImGui::Begin("Filters");
         ImGui::Checkbox("Is running?", &start_server);
