@@ -7,6 +7,7 @@
 #include <vector>
 #include <ctime>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
@@ -28,20 +29,48 @@ using json = nlohmann::json;
 
 struct SignalHistory
 {
+    std::map<int, std::vector<float>> streams_y;
     std::vector<float> x;
-    std::vector<float> y;
     float current_step = 0;
     const int max_points = 200;
-
-    void add_point(float value)
+    void add_points(const json &cells_array)
     {
         if (x.size() >= max_points)
         {
             x.erase(x.begin());
-            y.erase(y.begin());
+            for (auto &[pci, vec] : streams_y)
+                if (!vec.empty())
+                    vec.erase(vec.begin());
         }
         x.push_back(current_step++);
-        y.push_back(value);
+        std::vector<int> present_pcis;
+        for (auto &cell : cells_array)
+        {
+            int pci = cell["identity"].value("pci", -1);
+            if (pci == -1 || pci == 2147483647)
+                continue;
+            present_pcis.push_back(pci);
+            if (streams_y.find(pci) == streams_y.end())
+            {
+                streams_y[pci] = std::vector<float>(x.size() - 1, -145.0f);
+            }
+            float rsrp = -145.0f;
+            std::string type = cell.value("type", "");
+            if (type == "LTE")
+                rsrp = cell["signal"].value("rsrp", -145.0f);
+            else if (type == "NR")
+                rsrp = cell["signal"].value("ssRsrp", -145.0f);
+            else if (type == "GSM")
+                rsrp = cell["signal"].value("dbm", -145.0f);
+            streams_y[pci].push_back(rsrp);
+        }
+        for (auto &[pci, vec] : streams_y)
+        {
+            if (std::find(present_pcis.begin(), present_pcis.end(), pci) == present_pcis.end())
+            {
+                vec.push_back(-145.0f);
+            }
+        }
     }
 };
 
@@ -126,7 +155,6 @@ bool save_data_to_db(const char *req_data[], PGconn *con)
     return true;
 }
 
-
 // Сервер
 void run_server(PGconn *db_con)
 {
@@ -164,63 +192,47 @@ void run_server(PGconn *db_con)
             try
             {
                 auto j = json::parse(msg_str);
+                std::lock_guard<std::mutex> lock(mtx);
+                data_store.lat = std::to_string(j.value("lat", 0.0));
+                data_store.lon = std::to_string(j.value("lon", 0.0));
+                data_store.alt = std::to_string(j.value("alt", 0.0));
+                data_store.acc = std::to_string(j.value("acc", 0.0));
                 {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    data_store.lat = std::to_string(j.value("lat", 0.0));
-                    data_store.lon = std::to_string(j.value("lon", 0.0));
-                    data_store.alt = std::to_string(j.value("alt", 0.0));
-                    data_store.acc = std::to_string(j.value("acc", 0.0));
-                    if (j.contains("cell_data"))
+                    if (j.contains("cell_data") && j["cell_data"].contains("cells"))
                     {
-                        auto &cd = j["cell_data"];
-                        data_store.type = cd.value("type", "N/A");
-
-                        float rsrp_found = -145.0f;
-                        bool has_signal = false;
-
-                        if (cd.contains("signal"))
+                        auto &cells = j["cell_data"]["cells"];
+                        data_store.history.add_points(cells);
+                        for (auto &cell : cells)
                         {
-                            auto &sig = cd["signal"];
-                            if (data_store.type == "LTE" && sig.contains("rsrp"))
+                            if (cell.value("registered", false))
                             {
-                                rsrp_found = sig["rsrp"].get<float>();
-                                has_signal = true;
-                            }
-                            else if (data_store.type == "NR" && sig.contains("ssRsrp"))
-                            {
-                                rsrp_found = sig["ssRsrp"].get<float>();
-                                has_signal = true;
-                            }
-                            else if (data_store.type == "GSM" && sig.contains("dbm"))
-                            {
-                                rsrp_found = sig["dbm"].get<float>();
-                                has_signal = true;
-                            }
-                        }
+                                data_store.type = cell.value("type", "N/A");
 
-                        if (has_signal)
-                        {
-                            data_store.current_rsrp = rsrp_found;
-                            data_store.history.add_point(rsrp_found);
+                                float rsrp_val = -145.0f;
+                                if (data_store.type == "LTE")
+                                    rsrp_val = cell["signal"].value("rsrp", -145.0f);
+                                else if (data_store.type == "NR")
+                                    rsrp_val = cell["signal"].value("ssRsrp", -145.0f);
+                                else if (data_store.type == "GSM")
+                                    rsrp_val = cell["signal"].value("dbm", -145.0f);
+
+                                data_store.current_rsrp = rsrp_val;
+                                std::string s_rsrp = std::to_string(rsrp_val);
+                                const char *params[6] = {
+                                    data_store.lat.c_str(),
+                                    data_store.lon.c_str(),
+                                    data_store.alt.c_str(),
+                                    data_store.acc.c_str(),
+                                    data_store.type.c_str(),
+                                    s_rsrp.c_str()};
+                                save_data_to_db(params, db_con);
+
+                                log_messages.push_back("Recv: " + data_store.type + " | RSRP: " + s_rsrp);
+                                break;
+                            }
                         }
                     }
-                    std::string s_lat = std::to_string(j.value("lat", 0.0));
-                    std::string s_lon = std::to_string(j.value("lon", 0.0));
-                    std::string s_alt = std::to_string(j.value("alt", 0.0));
-                    std::string s_acc = std::to_string(j.value("acc", 0.0));
-                    std::string s_type = data_store.type;
-                    std::string s_rsrp = std::to_string(data_store.current_rsrp);
-
-                    const char *params[6] = {
-                        s_lat.c_str(),
-                        s_lon.c_str(),
-                        s_alt.c_str(),
-                        s_acc.c_str(),
-                        s_type.c_str(),
-                        s_rsrp.c_str()};
-                    save_data_to_db(params, db_con);
                     data_store.pending_records.push_back(j.dump());
-                    log_messages.push_back("Recv: " + data_store.type + " | RSRP: " + std::to_string(data_store.current_rsrp));
                     if (log_messages.size() > 50)
                         log_messages.erase(log_messages.begin());
                 }
@@ -319,8 +331,6 @@ void load_log_file()
     file.close();
 }
 
-
-
 // GUI
 void run_gui()
 {
@@ -386,16 +396,16 @@ void run_gui()
             ImPlot::SetupAxisLimits(ImAxis_Y1, -145, -40);
 
             std::lock_guard<std::mutex> lock(mtx);
-            if (!data_store.history.x.empty())
+            for (auto &[pci, y_vec] : data_store.history.streams_y)
             {
-                ImPlot::SetNextLineStyle(ImVec4(0, 1, 0, 1), 2.0f);
-                ImPlot::PlotLine("RSRP", data_store.history.x.data(), data_store.history.y.data(), (int)data_store.history.x.size());
+                std::string label = "PCI: " + std::to_string(pci);
+                ImPlot::PlotLine(label.c_str(), data_store.history.x.data(), y_vec.data(), (int)y_vec.size());
             }
             ImPlot::EndPlot();
         }
         ImGui::End();
 
-        //загрузка истории из файла на графикеи
+        // загрузка истории из файла на графикеи
         ImGui::Begin("Log Control");
         if (ImGui::Button("Load log.json", ImVec2(-1, 40)))
         {
@@ -411,7 +421,7 @@ void run_gui()
         }
         ImGui::End();
 
-        // история из файла 
+        // история из файла
         ImGui::Begin("Full Signal History");
         if (offline_store.loaded && !offline_store.rsrps.empty())
         {
@@ -449,9 +459,9 @@ void run_gui()
                 // Рисуем линию перемещения
                 ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 2.0f);
                 ImPlot::PlotScatter("route",
-                                 offline_store.lons.data(), // X
-                                 offline_store.lats.data(), // Y
-                                 (int)offline_store.lats.size());
+                                    offline_store.lons.data(), // X
+                                    offline_store.lats.data(), // Y
+                                    (int)offline_store.lats.size());
                 ImPlot::EndPlot();
             }
         }
@@ -475,7 +485,6 @@ void run_gui()
     ImGui::DestroyContext();
     SDL_Quit();
 }
-
 
 int main()
 {
