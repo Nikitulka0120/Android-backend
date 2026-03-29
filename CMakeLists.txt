@@ -15,7 +15,7 @@ include_directories(${SDL2_INCLUDE_DIRS})
 # OpenGL/GLEW
 find_package(OpenGL REQUIRED)
 find_package(GLEW REQUIRED)
-
+find_package(PostgreSQL REQUIRED)
 # ZeroMQ
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZMQ REQUIRED libzmq)
@@ -41,10 +41,10 @@ add_library(implot STATIC
     ${THIRD_PARTY_DIR}/implot/implot_demo.cpp
     ${THIRD_PARTY_DIR}/implot/implot_items.cpp
 )
-
+add_executable(main ${SRC_DIR}/main.cpp)
 target_include_directories(implot PUBLIC ${THIRD_PARTY_DIR}/implot)
 target_link_libraries(implot PRIVATE imgui)
 target_compile_options(implot PRIVATE -fPIC)
-
-add_executable(main ${SRC_DIR}/main.cpp)
+target_link_libraries(main PRIVATE PostgreSQL::PostgreSQL)
+target_include_directories(main PRIVATE ${THIRD_PARTY_DIR}/json/single_include)
 target_link_libraries(main PRIVATE imgui implot ${SDL2_LIBRARIES} ${OPENGL_LIBRARIES} ${GLEW_LIBRARIES} ${ZMQ_LIBRARIES})

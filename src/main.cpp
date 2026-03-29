@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 #include <ctime>
+#include <nlohmann/json.hpp>
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
@@ -14,6 +15,16 @@
 #include "implot.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
+
+#include <libpq-fe.h>
+
+#define HOST "localhost"
+#define PORT "5433"
+#define DB_NAME "android_backend"
+#define DB_USER "postgres" // по умолчанию postgres
+#define DB_USER_PASSWORD "somepassword"
+
+using json = nlohmann::json;
 
 struct SignalHistory
 {
@@ -34,12 +45,33 @@ struct SignalHistory
     }
 };
 
+struct OfflineData
+{
+    std::vector<double> lats;
+    std::vector<double> lons;
+    std::vector<double> rsrps;
+    std::vector<double> times;
+    std::vector<double> indices;
+
+    bool loaded = false;
+
+    void clear()
+    {
+        lats.clear();
+        lons.clear();
+        rsrps.clear();
+        times.clear();
+        indices.clear();
+        loaded = false;
+    }
+} offline_store;
+
 struct Telemetry
 {
     std::string lat = "0", lon = "0", alt = "0", acc = "0", type = "N/A";
     float current_rsrp = -140.0f;
     SignalHistory history;
-    std::vector<std::string> pending_records; 
+    std::vector<std::string> pending_records;
 } data_store;
 
 std::mutex mtx;
@@ -54,39 +86,49 @@ bool get_network = true;
 // переменные по приколу
 int session_data_counter = 0;
 
-std::string get_json_value(const std::string &json, const std::string &key)
+void flush_to_disk()
 {
-    std::string search_key = "\"" + key + "\"";
-    size_t key_pos = json.find(search_key);
-    if (key_pos == std::string::npos)
-        return "";
-
-    size_t colon_pos = json.find(":", key_pos);
-    if (colon_pos == std::string::npos)
-        return "";
-
-    size_t start = json.find_first_not_of(" \"", colon_pos + 1);
-    size_t end = json.find_first_of("\",}]", start);
-
-    if (start != std::string::npos && end != std::string::npos)
-    {
-        return json.substr(start, end - start);
-    }
-    return "";
-}
-
-void flush_to_disk() {
-    if (data_store.pending_records.empty()) return;
+    if (data_store.pending_records.empty())
+        return;
     std::ofstream file("log.json", std::ios::app);
-    if (file.is_open()) {
-        for (const auto& r : data_store.pending_records) file << r << "\n";
+    if (file.is_open())
+    {
+        for (const auto &r : data_store.pending_records)
+            file << r << "\n";
         file.close();
     }
     data_store.pending_records.clear();
 }
 
+bool save_data_to_db(const char *req_data[], PGconn *con)
+{
+    std::string query = "INSERT INTO network_logs "
+                        "(latitude, longitude, altitude, accuracy, network_type, rsrp) "
+                        "VALUES ($1, $2, $3, $4, $5, $6)";
+    PGresult *insert_res = PQexecParams(
+        con,
+        query.c_str(),
+        6,
+        NULL,
+        req_data,
+        NULL,
+        NULL,
+        0);
+
+    if (PQresultStatus(insert_res) != PGRES_COMMAND_OK)
+    {
+        std::cerr << "\033[31mОШИБКА DB\033[0m: " << PQresultErrorMessage(insert_res) << std::endl;
+        PQclear(insert_res);
+        return false;
+    }
+    std::cout << "Данные вставлены \033[32mУСПЕШНО!\033[0m" << std::endl;
+    PQclear(insert_res);
+    return true;
+}
+
+
 // Сервер
-void run_server()
+void run_server(PGconn *db_con)
 {
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::rep);
@@ -95,78 +137,191 @@ void run_server()
     try
     {
         socket.bind("tcp://*:7777");
-        std::cout << "[Server] Listening on 7777..." << std::endl;
+        std::cout << "[ZMQ Server] Started on port 7777. Waiting for Android..." << std::endl;
     }
     catch (const zmq::error_t &e)
     {
+        std::cerr << "[ZMQ Error] Bind failed: " << e.what() << std::endl;
         return;
     }
 
     while (running)
     {
-        if (!start_server) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
-        zmq::message_t request;
-        if (socket.recv(request, zmq::recv_flags::none))
+        if (!start_server)
         {
-            std::string msg(static_cast<char *>(request.data()), request.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
 
+        zmq::message_t request;
+        zmq::recv_result_t result = socket.recv(request, zmq::recv_flags::none);
+
+        if (result)
+        {
+            std::string msg_str(static_cast<char *>(request.data()), request.size());
+            std::cout << "[ZMQ] Received packet (" << msg_str.length() << " bytes)" << std::endl;
+
+            try
             {
-                std::lock_guard<std::mutex> lock(mtx);
-
-                data_store.lat = get_json_value(msg, "lat");
-                data_store.lon = get_json_value(msg, "lon");
-                data_store.alt = get_json_value(msg, "alt");
-                data_store.acc = get_json_value(msg, "acc");
-                data_store.type = get_json_value(msg, "type");
-
-                std::string s_val = "";
-                if (data_store.type == "LTE")
-                    s_val = get_json_value(msg, "rsrp");
-                else if (data_store.type == "NR")
-                    s_val = get_json_value(msg, "ssRsrp");
-                else if (data_store.type == "GSM")
-                    s_val = get_json_value(msg, "dbm");
-
-                if (!s_val.empty())
+                auto j = json::parse(msg_str);
                 {
-                    try
+                    std::lock_guard<std::mutex> lock(mtx);
+                    data_store.lat = std::to_string(j.value("lat", 0.0));
+                    data_store.lon = std::to_string(j.value("lon", 0.0));
+                    data_store.alt = std::to_string(j.value("alt", 0.0));
+                    data_store.acc = std::to_string(j.value("acc", 0.0));
+                    if (j.contains("cell_data"))
                     {
-                        data_store.current_rsrp = std::stof(s_val);
-                        data_store.history.add_point(data_store.current_rsrp);
-                    }
-                    catch (...) {}
-                }
+                        auto &cd = j["cell_data"];
+                        data_store.type = cd.value("type", "N/A");
 
-                log_messages.push_back("[" + data_store.type + "] RSRP: " + s_val);
-                if (log_messages.size() > 50)
-                    log_messages.erase(log_messages.begin());
-                data_store.pending_records.push_back(msg);
-                if (data_store.pending_records.size() >= 10) flush_to_disk();
+                        float rsrp_found = -145.0f;
+                        bool has_signal = false;
+
+                        if (cd.contains("signal"))
+                        {
+                            auto &sig = cd["signal"];
+                            if (data_store.type == "LTE" && sig.contains("rsrp"))
+                            {
+                                rsrp_found = sig["rsrp"].get<float>();
+                                has_signal = true;
+                            }
+                            else if (data_store.type == "NR" && sig.contains("ssRsrp"))
+                            {
+                                rsrp_found = sig["ssRsrp"].get<float>();
+                                has_signal = true;
+                            }
+                            else if (data_store.type == "GSM" && sig.contains("dbm"))
+                            {
+                                rsrp_found = sig["dbm"].get<float>();
+                                has_signal = true;
+                            }
+                        }
+
+                        if (has_signal)
+                        {
+                            data_store.current_rsrp = rsrp_found;
+                            data_store.history.add_point(rsrp_found);
+                        }
+                    }
+                    std::string s_lat = std::to_string(j.value("lat", 0.0));
+                    std::string s_lon = std::to_string(j.value("lon", 0.0));
+                    std::string s_alt = std::to_string(j.value("alt", 0.0));
+                    std::string s_acc = std::to_string(j.value("acc", 0.0));
+                    std::string s_type = data_store.type;
+                    std::string s_rsrp = std::to_string(data_store.current_rsrp);
+
+                    const char *params[6] = {
+                        s_lat.c_str(),
+                        s_lon.c_str(),
+                        s_alt.c_str(),
+                        s_acc.c_str(),
+                        s_type.c_str(),
+                        s_rsrp.c_str()};
+                    save_data_to_db(params, db_con);
+                    data_store.pending_records.push_back(j.dump());
+                    log_messages.push_back("Recv: " + data_store.type + " | RSRP: " + std::to_string(data_store.current_rsrp));
+                    if (log_messages.size() > 50)
+                        log_messages.erase(log_messages.begin());
+                }
+                if (data_store.pending_records.size() >= 10)
+                {
+                    flush_to_disk();
+                }
             }
-            session_data_counter++;
+            catch (const std::exception &e)
+            {
+                std::cerr << "[Data Error] Failed to process JSON: " << e.what() << std::endl;
+            }
             socket.send(zmq::buffer(std::string("OK")), zmq::send_flags::none);
+            session_data_counter++;
         }
     }
     std::lock_guard<std::mutex> lock(mtx);
     flush_to_disk();
+    std::cout << "[ZMQ Server] Thread stopped." << std::endl;
 }
 
-void ColoredIndicator(const char* label, bool condition, const char* true_text = "ON", const char* false_text = "OFF") {
+void ColoredIndicator(const char *label, bool condition, const char *true_text = "ON", const char *false_text = "OFF")
+{
     ImGui::Text("%s: ", label);
     ImGui::SameLine();
-    
-    if (condition) {
+
+    if (condition)
+    {
         ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 255, 0, 255));
         ImGui::Text("* %s", true_text);
         ImGui::PopStyleColor();
-    } else {
+    }
+    else
+    {
         ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255));
         ImGui::Text("* %s", false_text);
         ImGui::PopStyleColor();
     }
 }
 
-//GUI 
+void load_log_file()
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    offline_store.clear();
+
+    std::ifstream file("log.json");
+    if (!file.is_open())
+    {
+        std::cerr << "[Error] Could not open log.json for reading." << std::endl;
+        return;
+    }
+
+    std::string line;
+    int line_count = 0;
+    while (std::getline(file, line))
+    {
+        if (line.empty())
+            continue;
+
+        try
+        {
+            auto j = json::parse(line);
+
+            offline_store.lats.push_back(j.at("lat").get<double>());
+            offline_store.lons.push_back(j.at("lon").get<double>());
+            offline_store.times.push_back(j.at("time").get<double>());
+            offline_store.indices.push_back(line_count);
+            if (j.contains("cell_data") &&
+                j["cell_data"].contains("signal") &&
+                j["cell_data"]["signal"].contains("rsrp"))
+            {
+                double rsrp = j["cell_data"]["signal"]["rsrp"].get<double>();
+                offline_store.rsrps.push_back(rsrp);
+            }
+            else
+            {
+                offline_store.rsrps.push_back(-145.0);
+            }
+            line_count++;
+        }
+        catch (const json::parse_error &e)
+        {
+            std::cerr << "[JSON Error] Line " << line_count << ": " << e.what() << std::endl;
+        }
+        catch (const std::out_of_range &e)
+        {
+            std::cerr << "[Data Error] Required keys not found at line " << line_count << std::endl;
+        }
+    }
+
+    if (line_count > 0)
+    {
+        offline_store.loaded = true;
+        std::cout << "[Info] Loaded " << line_count << " records from log.json" << std::endl;
+    }
+    file.close();
+}
+
+
+
+// GUI
 void run_gui()
 {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0)
@@ -222,7 +377,7 @@ void run_gui()
         ColoredIndicator("Network", get_network);
         ImGui::End();
 
-        // Окно графика
+        // Окно графика realtime
         ImGui::Begin("Signal Graph");
         if (ImPlot::BeginPlot("History", ImVec2(-1, -1)))
         {
@@ -237,6 +392,72 @@ void run_gui()
                 ImPlot::PlotLine("RSRP", data_store.history.x.data(), data_store.history.y.data(), (int)data_store.history.x.size());
             }
             ImPlot::EndPlot();
+        }
+        ImGui::End();
+
+        //загрузка истории из файла на графикеи
+        ImGui::Begin("Log Control");
+        if (ImGui::Button("Load log.json", ImVec2(-1, 40)))
+        {
+            load_log_file();
+        }
+        if (offline_store.loaded)
+        {
+            ImGui::TextColored(ImVec4(0, 1, 0, 1), "Total: %d records", (int)offline_store.lats.size());
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(1, 0, 0, 1), "Records not loaded");
+        }
+        ImGui::End();
+
+        // история из файла 
+        ImGui::Begin("Full Signal History");
+        if (offline_store.loaded && !offline_store.rsrps.empty())
+        {
+            if (ImPlot::BeginPlot("RSRP History", ImVec2(-1, -1)))
+            {
+                ImPlot::SetupAxes("Record Index", "dBm");
+                ImPlot::SetupAxisLimits(ImAxis_Y1, -145, -40);
+                ImPlot::SetupAxisLimits(ImAxis_X1, 0, offline_store.indices.size(), ImGuiCond_Always);
+                ImPlot::SetNextLineStyle(ImVec4(0, 1, 0, 1), 1.5f);
+                ImPlot::PlotLine("RSRP",
+                                 offline_store.indices.data(),
+                                 offline_store.rsrps.data(),
+                                 (int)offline_store.rsrps.size());
+
+                ImPlot::EndPlot();
+            }
+        }
+        else
+        {
+            ImGui::Text("Load data first.");
+        }
+        ImGui::End();
+
+        // гео график по истории
+        ImGui::Begin("Movement Route");
+        if (offline_store.loaded && !offline_store.lats.empty())
+        {
+            if (ImPlot::BeginPlot("Map", ImVec2(-1, -1)))
+            {
+                // Lon - по X, Lat - по Y
+                ImPlot::SetupAxes("Longitude", "Latitude");
+                ImPlot::SetupAxisLimits(ImAxis_X1, 82.900, 82.960, ImGuiCond_Once);
+                ImPlot::SetupAxisLimits(ImAxis_Y1, 55.000, 55.040, ImGuiCond_Once);
+
+                // Рисуем линию перемещения
+                ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 2.0f);
+                ImPlot::PlotScatter("route",
+                                 offline_store.lons.data(), // X
+                                 offline_store.lats.data(), // Y
+                                 (int)offline_store.lats.size());
+                ImPlot::EndPlot();
+            }
+        }
+        else
+        {
+            ImGui::Text("Load data first.");
         }
         ImGui::End();
 
@@ -255,9 +476,26 @@ void run_gui()
     SDL_Quit();
 }
 
+
 int main()
 {
-    std::thread server(run_server);
+    PGconn *con;   // обьект подключения
+    PGresult *res; // результат запроса к базе
+    const char *info = "host=" HOST " port=" PORT " dbname=" DB_NAME " user=" DB_USER " password=" DB_USER_PASSWORD;
+    con = PQconnectdb(info); // Выполняем SQL-запрос из переменной info
+    if (PQstatus(con) != CONNECTION_OK)
+    { // если подключение не удалось пишем ошибку
+        std::cerr << "\033[31mОШИБКА\033[0m подключения к БД.\n"
+                  << PQerrorMessage(con) << "\n";
+        PQfinish(con); // рвём подключение перед выходом
+        exit(1);
+    }
+    else
+    {
+        std::cout << "Подключение \033[32mУСПЕШНО!\033[0m\n\n"
+                  << std::endl;
+    }
+    std::thread server(run_server, con);
     run_gui();
     server.join();
     return 0;
