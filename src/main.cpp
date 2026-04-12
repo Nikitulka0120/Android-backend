@@ -1,3 +1,4 @@
+#define _USE_MATH_DEFINES
 #include <zmq.hpp>
 #include <string>
 #include <iostream>
@@ -8,10 +9,14 @@
 #include <ctime>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cmath>
+#include <curl/curl.h>
+#include <numbers>
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
-
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 #include "imgui.h"
 #include "implot.h"
 #include "backends/imgui_impl_opengl3.h"
@@ -102,6 +107,138 @@ struct Telemetry
     SignalHistory history;
     std::vector<std::string> pending_records;
 } data_store;
+
+static const ImPlotAxisFlags _xFlags{
+    ImPlotAxisFlags_NoLabel | ImPlotAxisFlags_NoGridLines |
+    ImPlotAxisFlags_NoTickMarks | ImPlotAxisFlags_NoTickLabels |
+    ImPlotAxisFlags_NoInitialFit | ImPlotAxisFlags_NoMenus |
+    ImPlotAxisFlags_NoMenus | ImPlotAxisFlags_NoHighlight};
+
+static const ImPlotAxisFlags _yFlags{_xFlags |
+                                     ImPlotAxisFlags_Invert};
+
+double PI = M_PI;
+double PI2 = M_PI * 2;
+double RAD = M_PI / 180.0;
+double DEG = 180.0 / M_PI;
+
+int POW2[]{
+    (1 << 0), (1 << 1), (1 << 2), (1 << 3), (1 << 4), (1 << 5), (1 << 6),
+    (1 << 7), (1 << 8), (1 << 9), (1 << 10), (1 << 11), (1 << 12), (1 << 13),
+    (1 << 14), (1 << 15), (1 << 16), (1 << 17), (1 << 18)};
+
+double lon2x(const double lon, int z = 0)
+{
+    return (lon + 180.0) / 360.0 * double(POW2[z]);
+}
+
+double lat2y(const double lat, int z = 0)
+{
+    return (1.0 - asinh(tan(lat * RAD)) / PI) / 2.0 * double(POW2[z]);
+}
+
+double x2lon(const double x, int z = 0)
+{
+    return x / double(POW2[z]) * 360.0 - 180.0;
+}
+
+double y2lat(const double y, const int z = 0)
+{
+    const double n{PI - PI2 * y / double(POW2[z])};
+    return DEG * atan(0.5 * (exp(n) - exp(-n)));
+}
+
+double _minLat{-85.0};
+double _maxLat{+85.0};
+double _minLon{-179.9};
+double _maxLon{+179.9};
+int MinZoom{0};
+int MaxZoom{18};
+
+double _minX = lon2x(_minLon, 0);
+double _maxX = lon2x(_maxLon, 0);
+double _minY = lat2y(_minLat, 0);
+double _maxY = lat2y(_maxLat, 0);
+
+ImPlotPoint _mousePos{};
+ImPlotRect _plotLims{};
+ImVec2 _plotSize{};
+
+int _width{256}, _height{256}, _channels{};
+std::vector<unsigned char> _rawBlob;
+unsigned char *data;
+GLuint _id{0};
+
+bool loaded = false;
+
+void glLoad()
+{
+    glGenTextures(1, &_id);
+    glBindTexture(GL_TEXTURE_2D, _id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _width, _height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, data);
+}
+
+void stbLoad()
+{
+    data = stbi_load_from_memory(_rawBlob.data(), _rawBlob.size(), &_width, &_height, &_channels, STBI_rgb_alpha);
+}
+
+std::string makeUrl(int z, int x, int y)
+{
+    std::ostringstream urlmaker;
+    urlmaker << "https://a.tile.openstreetmap.org";
+    urlmaker << '/' << z << '/' << x << '/' << y << ".png";
+    return urlmaker.str();
+}
+
+size_t onPullResponse(void *data, size_t size, size_t nmemb,
+                      void *userp)
+{
+    size_t realsize{size * nmemb};
+    auto &blob{*static_cast<std::vector<unsigned char> *>(userp)};
+    auto const *const dataptr{static_cast<unsigned char *>(data)};
+    blob.insert(blob.cend(), dataptr, dataptr + realsize);
+    std::cout << "tile size = " << realsize << std::endl;
+    return realsize;
+}
+
+bool receiveTile(int z, int x, int y,
+                 std::vector<unsigned char> &blob)
+{
+    CURL *curl{curl_easy_init()};
+    curl_easy_setopt(curl, CURLOPT_URL, makeUrl(z, x, y).c_str());
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+    // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "curl");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 1);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&blob);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, onPullResponse);
+    const bool ok{curl_easy_perform(curl) == CURLE_OK};
+    curl_easy_cleanup(curl);
+    loaded = true;
+    return ok;
+}
+
+std::vector<unsigned char> tileRequest(int z, int x, int y)
+{
+    std::vector<unsigned char> blob;
+    if (receiveTile(z, x, y, blob))
+    {
+        std::cout << "tile is received" << std::endl;
+        // тут в blob лежат байтики после получения тайлов
+    }
+    else
+    {
+        std::cout << "tile is not received" << std::endl;
+        // тут Dummy байтики
+    }
+    return blob;
+}
 
 std::mutex mtx;
 std::vector<std::string> log_messages;
@@ -342,6 +479,11 @@ void run_gui()
 
     ImGui::CreateContext();
     ImPlot::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // Включить Keyboard Controls
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;  // Включить Gamepad Controls
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init("#version 330");
@@ -444,7 +586,35 @@ void run_gui()
             ImGui::Text("Load data first.");
         }
         ImGui::End();
+        ImPlot::BeginPlot("##ImOsmMapPlot");
 
+        if (!loaded)
+        {
+            std::cout << "min max X = " << _minX << " " << _maxX << std::endl;
+            std::cout << "min max y = " << _minY << " " << _maxY << std::endl;
+        }
+        // Top-left of the texture
+        // Bottom-right of the texture
+        ImVec2 _uv0{0, 0}, _uv1{1, 1};
+        ImVec4 _tint{1, 1, 1, 1};
+        ImVec2 bmin{0, 0};
+        ImVec2 bmax{256, 256};
+        if (!loaded)
+        {
+
+            std::cout << "min max X = " << _minX << " " << _maxX << std::endl;
+            std::cout << "min max y = " << _minY << " " << _maxY << std::endl;
+            _rawBlob = tileRequest(16, 47867, 20726);
+
+            stbLoad();
+            glLoad();
+        }
+        if (loaded)
+        {
+            ImPlot::PlotImage("##", _id, bmin, bmax, _uv0, _uv1, _tint);
+        }
+
+        ImPlot::EndPlot();
         // гео график по истории
         ImGui::Begin("Movement Route");
         if (offline_store.loaded && !offline_store.lats.empty())
