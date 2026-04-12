@@ -148,6 +148,12 @@ double y2lat(const double y, const int z = 0)
     return DEG * atan(0.5 * (exp(n) - exp(-n)));
 }
 
+void getTileCoords(double lon, double lat, int zoom, int &x, int &y)
+{
+    x = (int)lon2x(lon, zoom);
+    y = (int)lat2y(lat, zoom);
+}
+
 double _minLat{-85.0};
 double _maxLat{+85.0};
 double _minLon{-179.9};
@@ -164,27 +170,73 @@ ImPlotPoint _mousePos{};
 ImPlotRect _plotLims{};
 ImVec2 _plotSize{};
 
-int _width{256}, _height{256}, _channels{};
-std::vector<unsigned char> _rawBlob;
-unsigned char *data;
-GLuint _id{0};
-
-bool loaded = false;
-
-void glLoad()
+struct TileInfo
 {
-    glGenTextures(1, &_id);
-    glBindTexture(GL_TEXTURE_2D, _id);
+    int width, height, channels;
+    unsigned char *data;
+    std::vector<unsigned char> blob;
+    GLuint texture_id;
+    bool loaded;
+    bool loading;
+    int x, y, z;
+};
+
+std::vector<TileInfo> tiles;
+struct MapState
+{
+    int current_zoom = 16;
+    double center_lon = 82.92;
+    double center_lat = 55.03;
+    bool need_reload = false;
+} map_state;
+
+void clearTiles()
+{
+    for (auto &tile : tiles)
+    {
+        if (tile.texture_id != 0)
+            glDeleteTextures(1, &tile.texture_id);
+        if (tile.data != nullptr)
+            stbi_image_free(tile.data);
+    }
+    tiles.clear();
+}
+
+void glLoad(int index)
+{
+    glGenTextures(1, &tiles[index].texture_id);
+    glBindTexture(GL_TEXTURE_2D, tiles[index].texture_id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _width, _height, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, data);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                 tiles[index].width,
+                 tiles[index].height,
+                 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 tiles[index].data);
+    tiles[index].loaded = true;
 }
 
-void stbLoad()
+void stbLoad(int index)
 {
-    data = stbi_load_from_memory(_rawBlob.data(), _rawBlob.size(), &_width, &_height, &_channels, STBI_rgb_alpha);
+    tiles[index].data = stbi_load_from_memory(
+        tiles[index].blob.data(),
+        tiles[index].blob.size(),
+        &tiles[index].width,
+        &tiles[index].height,
+        &tiles[index].channels,
+        STBI_rgb_alpha);
+}
+
+int findTile(int z, int x, int y)
+{
+    for (size_t i = 0; i < tiles.size(); i++)
+    {
+        if (tiles[i].z == z && tiles[i].x == x && tiles[i].y == y)
+            return i;
+    }
+    return -1;
 }
 
 std::string makeUrl(int z, int x, int y)
@@ -212,32 +264,82 @@ bool receiveTile(int z, int x, int y,
     CURL *curl{curl_easy_init()};
     curl_easy_setopt(curl, CURLOPT_URL, makeUrl(z, x, y).c_str());
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-    // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "curl");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 1);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&blob);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, onPullResponse);
-    const bool ok{curl_easy_perform(curl) == CURLE_OK};
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
     curl_easy_cleanup(curl);
-    loaded = true;
-    return ok;
+
+    if (res == CURLE_OK && http_code == 200 && !blob.empty())
+    {
+        return true;
+    }
+
+    std::cout << "tile failed: " << z << "/" << x << "/" << y << " HTTP: " << http_code << std::endl;
+    blob.clear();
+    return false;
 }
 
 std::vector<unsigned char> tileRequest(int z, int x, int y)
 {
-    std::vector<unsigned char> blob;
-    if (receiveTile(z, x, y, blob))
+    if (x < 0 || x >= POW2[z] || y < 0 || y >= POW2[z])
     {
-        std::cout << "tile is received" << std::endl;
-        // тут в blob лежат байтики после получения тайлов
+        std::cout << "invalid tile coordinates: " << z << "/" << x << "/" << y << std::endl;
+        return std::vector<unsigned char>();
+    }
+
+    int idx = findTile(z, x, y);
+    if (idx != -1)
+    {
+        if (tiles[idx].loading)
+        {
+            return std::vector<unsigned char>();
+        }
+        if (tiles[idx].loaded)
+        {
+            return std::vector<unsigned char>();
+        }
+    }
+
+    if (idx == -1)
+    {
+        TileInfo new_tile;
+        new_tile.z = z;
+        new_tile.x = x;
+        new_tile.y = y;
+        new_tile.loaded = false;
+        new_tile.loading = true;
+        new_tile.texture_id = 0;
+        new_tile.data = nullptr;
+        tiles.push_back(new_tile);
+        idx = tiles.size() - 1;
     }
     else
     {
-        std::cout << "tile is not received" << std::endl;
-        // тут Dummy байтики
+        tiles[idx].loading = true;
     }
-    return blob;
+
+    std::vector<unsigned char> blob;
+    if (receiveTile(z, x, y, blob) && !blob.empty())
+    {
+        std::cout << "tile is received: " << z << "/" << x << "/" << y << " size: " << blob.size() << std::endl;
+        tiles[idx].blob = blob;
+        tiles[idx].loading = false;
+        return blob;
+    }
+    else
+    {
+        std::cout << "tile is not received: " << z << "/" << x << "/" << y << std::endl;
+        tiles[idx].loading = false;
+        tiles.erase(tiles.begin() + idx);
+        return std::vector<unsigned char>();
+    }
 }
 
 std::mutex mtx;
@@ -468,6 +570,61 @@ void load_log_file()
     file.close();
 }
 
+void loadTilesForCurrentView(ImPlotRect &plot_lims, ImVec2 plot_size)
+{
+    const int TILE_SIZE_PX = 256;
+    int tiles_x_needed = ceil(plot_size.x / TILE_SIZE_PX) + 2;
+    int tiles_y_needed = ceil(plot_size.y / TILE_SIZE_PX) + 2;
+    double center_lon = (plot_lims.X.Min + plot_lims.X.Max) / 2.0;
+    double center_lat = (plot_lims.Y.Min + plot_lims.Y.Max) / 2.0;
+
+    int center_tile_x = (int)lon2x(center_lon, map_state.current_zoom);
+    int center_tile_y = (int)lat2y(center_lat, map_state.current_zoom);
+
+    int min_x = center_tile_x - tiles_x_needed / 2;
+    int max_x = center_tile_x + tiles_x_needed / 2;
+    int min_y = center_tile_y - tiles_y_needed / 2;
+    int max_y = center_tile_y + tiles_y_needed / 2;
+
+    if (min_x < 0)
+        min_x = 0;
+    if (max_x > POW2[map_state.current_zoom])
+        max_x = POW2[map_state.current_zoom];
+    if (min_y < 0)
+        min_y = 0;
+    if (max_y > POW2[map_state.current_zoom])
+        max_y = POW2[map_state.current_zoom];
+
+    std::cout << "Window size: " << plot_size.x << "x" << plot_size.y << " px" << std::endl;
+    std::cout << "Tiles needed: " << tiles_x_needed << "x" << tiles_y_needed << std::endl;
+    std::cout << "Tile range X: " << min_x << " - " << max_x << std::endl;
+    std::cout << "Tile range Y: " << min_y << " - " << max_y << std::endl;
+
+    int loaded = 0;
+    for (int y = min_y; y <= max_y; y++)
+    {
+        for (int x = min_x; x <= max_x; x++)
+        {
+            int idx = findTile(map_state.current_zoom, x, y);
+            if (idx == -1)
+            {
+                std::vector<unsigned char> blob = tileRequest(map_state.current_zoom, x, y);
+                if (!blob.empty())
+                {
+                    int current_idx = findTile(map_state.current_zoom, x, y);
+                    if (current_idx != -1)
+                    {
+                        stbLoad(current_idx);
+                        glLoad(current_idx);
+                        loaded++;
+                    }
+                }
+            }
+        }
+    }
+    std::cout << "Loaded " << loaded << " new tiles" << std::endl;
+}
+
 // GUI
 void run_gui()
 {
@@ -586,35 +743,77 @@ void run_gui()
             ImGui::Text("Load data first.");
         }
         ImGui::End();
-        ImPlot::BeginPlot("##ImOsmMapPlot");
 
-        if (!loaded)
+        ImGui::Begin("Map");
+        if (ImPlot::BeginPlot("##ImOsmMapPlot", ImVec2(-1, -1)))
         {
-            std::cout << "min max X = " << _minX << " " << _maxX << std::endl;
-            std::cout << "min max y = " << _minY << " " << _maxY << std::endl;
-        }
-        // Top-left of the texture
-        // Bottom-right of the texture
-        ImVec2 _uv0{0, 0}, _uv1{1, 1};
-        ImVec4 _tint{1, 1, 1, 1};
-        ImVec2 bmin{0, 0};
-        ImVec2 bmax{256, 256};
-        if (!loaded)
-        {
+            ImVec2 _uv0{0, 0}, _uv1{1, 1};
+            ImVec4 _tint{1, 1, 1, 1};
 
-            std::cout << "min max X = " << _minX << " " << _maxX << std::endl;
-            std::cout << "min max y = " << _minY << " " << _maxY << std::endl;
-            _rawBlob = tileRequest(16, 47867, 20726);
+            ImPlot::SetupAxes("Lon", "Lat");
 
-            stbLoad();
-            glLoad();
-        }
-        if (loaded)
-        {
-            ImPlot::PlotImage("##", _id, bmin, bmax, _uv0, _uv1, _tint);
-        }
+            static bool initial_zoom_set = false;
+            if (!initial_zoom_set)
+            {
+                ImPlot::SetupAxisLimits(ImAxis_X1, 82.92, 82.93, ImGuiCond_Once);
+                ImPlot::SetupAxisLimits(ImAxis_Y1, 55.02, 55.03, ImGuiCond_Once);
+                initial_zoom_set = true;
+            }
 
-        ImPlot::EndPlot();
+            ImVec2 mouse_pos = ImGui::GetMousePos();
+            ImVec2 plot_pos = ImPlot::GetPlotPos();
+            ImVec2 plot_size = ImPlot::GetPlotSize();
+
+            if (mouse_pos.x >= plot_pos.x && mouse_pos.x <= plot_pos.x + plot_size.x &&
+                mouse_pos.y >= plot_pos.y && mouse_pos.y <= plot_pos.y + plot_size.y)
+            {
+                float mouse_wheel = ImGui::GetIO().MouseWheel;
+                if (mouse_wheel != 0)
+                {
+                    int new_zoom = map_state.current_zoom + (mouse_wheel > 0 ? 1 : -1);
+                    if (new_zoom >= MinZoom && new_zoom <= MaxZoom && new_zoom != map_state.current_zoom)
+                    {
+                        map_state.current_zoom = new_zoom;
+                        map_state.need_reload = true;
+                        clearTiles();
+                    }
+                }
+            }
+
+            ImPlotRect plot_lims = ImPlot::GetPlotLimits();
+            ImVec2 plot_size_px = ImPlot::GetPlotSize();
+            if (tiles.empty() || map_state.need_reload)
+            {
+                loadTilesForCurrentView(plot_lims, plot_size_px);
+                map_state.need_reload = false;
+            }
+
+            for (size_t i = 0; i < tiles.size(); i++)
+            {
+                if (tiles[i].loaded && tiles[i].z == map_state.current_zoom)
+                {
+                    double tile_min_lon = x2lon(tiles[i].x, tiles[i].z);
+                    double tile_max_lon = x2lon(tiles[i].x + 1, tiles[i].z);
+                    double tile_max_lat = y2lat(tiles[i].y, tiles[i].z);
+                    double tile_min_lat = y2lat(tiles[i].y + 1, tiles[i].z);
+
+                    ImVec2 tile_bmin(tile_min_lon, tile_min_lat);
+                    ImVec2 tile_bmax(tile_max_lon, tile_max_lat);
+
+                    ImPlot::PlotImage(("##tile_" + std::to_string(i)).c_str(),
+                                      tiles[i].texture_id,
+                                      tile_bmin,
+                                      tile_bmax,
+                                      _uv0,
+                                      _uv1,
+                                      _tint);
+                }
+            }
+
+            ImPlot::EndPlot();
+        }
+        ImGui::End();
+
         // гео график по истории
         ImGui::Begin("Movement Route");
         if (offline_store.loaded && !offline_store.lats.empty())
@@ -623,8 +822,8 @@ void run_gui()
             {
                 // Lon - по X, Lat - по Y
                 ImPlot::SetupAxes("Longitude", "Latitude");
-                ImPlot::SetupAxisLimits(ImAxis_X1, 82.900, 82.960, ImGuiCond_Once);
-                ImPlot::SetupAxisLimits(ImAxis_Y1, 55.000, 55.040, ImGuiCond_Once);
+                ImPlot::SetupAxisLimits(ImAxis_X1, 82.915, 82.925, ImGuiCond_Once);
+                ImPlot::SetupAxisLimits(ImAxis_Y1, 55.025, 55.035, ImGuiCond_Once);
 
                 // Рисуем линию перемещения
                 ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 2.0f);
