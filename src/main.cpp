@@ -23,6 +23,14 @@
 #include <libpq-fe.h>
 #include <queue>
 #include <curl/curl.h>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+
+
+using namespace std;
+namespace fs = filesystem;
 
 #define HOST "localhost"
 #define PORT "5433"
@@ -57,7 +65,7 @@ double TileYToMercatorY(int tileY, int zoom)
 
 double LatToMercatorY(double lat)
 {
-    lat = std::max(-85.0511, std::min(85.0511, lat));
+    lat = max(-85.0511, min(85.0511, lat));
     double lat_rad = lat * M_PI / 180.0;
     double mercator_y = log(tan(M_PI / 4 + lat_rad / 2));
     return mercator_y * 180.0 / M_PI;
@@ -72,7 +80,7 @@ double MercatorYToLat(double mercator_y)
 
 struct TileJob
 {
-    std::string id; // строковый идентификатор "zoom/x/y"
+    string id; // строковый идентификатор "zoom/x/y"
     int zoom;
     int x;
     int y;
@@ -82,22 +90,23 @@ struct TextureData
 {
     GLuint id = 0;                 // id текстуры в GPU
     bool isLoading = false;        // идет загрузка или нет
-    std::vector<uint8_t> rgbaBlob; // пиксели в ОЗУ (до переноса в GPU)
+    bool isLoaded = false;         // полностью загружена
+    vector<uint8_t> rgbaBlob; // пиксели в ОЗУ (до переноса в GPU)
     int width = 0;
     int height = 0;
 };
 
-std::map<std::string, TextureData> g_TileCache; // кэш текстур, мапа для сопоставления тайла и его индентификатора
-std::queue<TileJob> g_JobQueue;                 // очередь на загрузку
+map<string, TextureData> g_TileCache; // кэш текстур, мапа для сопоставления тайла и его индентификатора
+queue<TileJob> g_JobQueue;                 // очередь на загрузку
 
 // мьютексы
-std::mutex g_JobMutex;
-std::mutex g_CacheMutex;
+mutex g_JobMutex;
+mutex g_CacheMutex;
 
 struct SignalHistory // используется для отображения данных о вышках
 {
-    std::map<int, std::vector<float>> streams_y;
-    std::vector<float> x;
+    map<int, vector<float>> streams_y;
+    vector<float> x;
     float current_step = 0;
     const int max_points = 200;
     void add_points(const json &cells_array)
@@ -110,7 +119,7 @@ struct SignalHistory // используется для отображения �
                     vec.erase(vec.begin());
         }
         x.push_back(current_step++);
-        std::vector<int> present_pcis;
+        vector<int> present_pcis;
         for (auto &cell : cells_array)
         {
             int pci = cell["identity"].value("pci", -1);
@@ -119,10 +128,10 @@ struct SignalHistory // используется для отображения �
             present_pcis.push_back(pci);
             if (streams_y.find(pci) == streams_y.end())
             {
-                streams_y[pci] = std::vector<float>(x.size() - 1, -145.0f);
+                streams_y[pci] = vector<float>(x.size() - 1, -145.0f);
             }
             float rsrp = -145.0f;
-            std::string type = cell.value("type", "");
+            string type = cell.value("type", "");
             if (type == "LTE")
                 rsrp = cell["signal"].value("rsrp", -145.0f);
             else if (type == "NR")
@@ -133,7 +142,7 @@ struct SignalHistory // используется для отображения �
         }
         for (auto &[pci, vec] : streams_y)
         {
-            if (std::find(present_pcis.begin(), present_pcis.end(), pci) == present_pcis.end())
+            if (find(present_pcis.begin(), present_pcis.end(), pci) == present_pcis.end())
             {
                 vec.push_back(-145.0f);
             }
@@ -143,11 +152,11 @@ struct SignalHistory // используется для отображения �
 
 struct OfflineData // для отображения данных ищ файла
 {
-    std::vector<double> lats;
-    std::vector<double> lons;
-    std::vector<double> rsrps;
-    std::vector<double> times;
-    std::vector<double> indices;
+    vector<double> lats;
+    vector<double> lons;
+    vector<double> rsrps;
+    vector<double> times;
+    vector<double> indices;
 
     bool loaded = false;
 
@@ -164,14 +173,14 @@ struct OfflineData // для отображения данных ищ файла
 
 struct Telemetry // основная структура данных
 {
-    std::string lat = "0", lon = "0", alt = "0", acc = "0", type = "N/A";
+    string lat = "0", lon = "0", alt = "0", acc = "0", type = "N/A";
     float current_rsrp = -140.0f;
     SignalHistory history;
-    std::vector<std::string> pending_records;
+    vector<string> pending_records;
 } data_store;
 
-std::mutex mtx;
-std::vector<std::string> log_messages;
+mutex mtx;
+vector<string> log_messages;
 
 // серверные переменные для будущих фильтров
 bool running = true; // это вообще не трогаем
@@ -186,7 +195,7 @@ void flush_to_disk() // запись данных на диск
 {
     if (data_store.pending_records.empty())
         return;
-    std::ofstream file("log.json", std::ios::app);
+    ofstream file("log.json", ios::app);
     if (file.is_open())
     {
         for (const auto &r : data_store.pending_records)
@@ -196,11 +205,52 @@ void flush_to_disk() // запись данных на диск
     data_store.pending_records.clear();
 }
 
+string GetTilePath(int zoom, int x, int y)
+{
+    stringstream strin;
+    strin << "tile_cache/" << zoom << "/" << x;
+    fs::create_directories(strin.str());
+
+    strin << "/" << y << ".png";
+    return strin.str();
+}
+
+bool LoadTileFromDisk(int zoom, int x, int y, vector<uint8_t> &out_data)
+{
+    string path = GetTilePath(zoom, x, y);
+
+    ifstream file(path, ios::binary);
+    if (!file.is_open())
+    {
+        return false;
+    }
+    file.seekg(0, ios::end);
+    size_t size = file.tellg();
+    file.seekg(0, ios::beg);
+
+    out_data.resize(size);
+    file.read(reinterpret_cast<char *>(out_data.data()), size);
+    return file.good();
+}
+
+// кидаем тайл на дискк
+void SaveTileToDisk(int zoom, int x, int y, const vector<uint8_t> &data)
+{
+    string path = GetTilePath(zoom, x, y);
+
+    ofstream file(path, ios::binary);
+    if (file.is_open())
+    {
+        file.write(reinterpret_cast<const char *>(data.data()), data.size());
+        file.close();
+    }
+}
+
 // callback из примера
 size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
 {
     size_t realsize = size * nmemb;
-    auto &buffer = *static_cast<std::vector<uint8_t> *>(userp);
+    auto &buffer = *static_cast<vector<uint8_t> *>(userp);
     const auto *dataptr = static_cast<uint8_t *>(contents);
     buffer.insert(buffer.end(), dataptr, dataptr + realsize);
     return realsize;
@@ -212,17 +262,15 @@ void FetchWorker()
     if (!curl)
         return;
 
-    // настройки курлы
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "curl");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5);
 
     while (true)
     {
         TileJob job;
         bool foundJob = false;
 
-        // берем задачу
         g_JobMutex.lock();
         if (!g_JobQueue.empty())
         {
@@ -238,42 +286,62 @@ void FetchWorker()
             continue;
         }
 
-        // грузим тайл
-        std::vector<uint8_t> rawBlob;
-        std::string url = "https://a.tile.openstreetmap.org/" + std::to_string(job.zoom) + "/" + std::to_string(job.x) + "/" + std::to_string(job.y) + ".png";
+        vector<uint8_t> rawBlob;
+        bool loaded = false;
 
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rawBlob);
+        // с диска
+        if (LoadTileFromDisk(job.zoom, job.x, job.y, rawBlob))
+        {
+            cout << "[Cache] Loaded from disk: " << job.id << endl;
+            loaded = true;
+        }
+        else
+        {
+            // интернет
+            string url = "https://a.tile.openstreetmap.org/" + 
+                             to_string(job.zoom) + "/" + 
+                             to_string(job.x) + "/" + 
+                             to_string(job.y) + ".png";
 
-        if (curl_easy_perform(curl) == CURLE_OK)
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rawBlob);
+
+            if (curl_easy_perform(curl) == CURLE_OK)
+            {
+                cout << "[Download] Loaded from web: " << job.id << endl;
+                SaveTileToDisk(job.zoom, job.x, job.y, rawBlob);
+                loaded = true;
+            }
+            else
+            {
+                cerr << "[Error] Failed to load tile: " << job.id << endl;
+            }
+        }
+        g_CacheMutex.lock();
+        if (loaded && !rawBlob.empty())
         {
             int w, h, ch;
-            unsigned char *data = stbi_load_from_memory(rawBlob.data(), (int)rawBlob.size(), &w, &h, &ch, STBI_rgb_alpha);
-
+            unsigned char *data = stbi_load_from_memory(rawBlob.data(), (int)rawBlob.size(),
+                                                        &w, &h, &ch, STBI_rgb_alpha);
             if (data)
             {
-                g_CacheMutex.lock();
-                if (g_TileCache.count(job.id))
-                {
-                    g_TileCache[job.id].rgbaBlob.assign(data, data + (w * h * 4));
-                    g_TileCache[job.id].width = w;
-                    g_TileCache[job.id].height = h;
-                    g_TileCache[job.id].isLoading = false;
-                }
-                g_CacheMutex.unlock();
-
+                g_TileCache[job.id].rgbaBlob.assign(data, data + (w * h * 4));
+                g_TileCache[job.id].width = w;
+                g_TileCache[job.id].height = h;
+                g_TileCache[job.id].isLoading = false;
+                g_TileCache[job.id].isLoaded = true;
                 stbi_image_free(data);
+            }
+            else
+            {
+                g_TileCache[job.id].isLoading = false;
             }
         }
         else
         {
-            g_CacheMutex.lock();
-            if (g_TileCache.count(job.id))
-            {
-                g_TileCache[job.id].isLoading = false;
-            }
-            g_CacheMutex.unlock();
+            g_TileCache[job.id].isLoading = false;
         }
+        g_CacheMutex.unlock();
     }
 
     curl_easy_cleanup(curl);
@@ -281,7 +349,7 @@ void FetchWorker()
 
 bool save_data_to_db(const char *req_data[], PGconn *con) // сохранение данных в бд
 {
-    std::string query = "INSERT INTO network_logs "
+    string query = "INSERT INTO network_logs "
                         "(latitude, longitude, altitude, accuracy, network_type, rsrp) "
                         "VALUES ($1, $2, $3, $4, $5, $6)";
     PGresult *insert_res = PQexecParams(
@@ -296,11 +364,11 @@ bool save_data_to_db(const char *req_data[], PGconn *con) // сохранени�
 
     if (PQresultStatus(insert_res) != PGRES_COMMAND_OK)
     {
-        std::cerr << "\033[31mОШИБКА DB\033[0m: " << PQresultErrorMessage(insert_res) << std::endl;
+        cerr << "\033[31mОШИБКА DB\033[0m: " << PQresultErrorMessage(insert_res) << endl;
         PQclear(insert_res);
         return false;
     }
-    std::cout << "Данные вставлены \033[32mУСПЕШНО!\033[0m" << std::endl;
+    cout << "Данные вставлены \033[32mУСПЕШНО!\033[0m" << endl;
     PQclear(insert_res);
     return true;
 }
@@ -315,11 +383,11 @@ void run_server(PGconn *db_con)
     try
     {
         socket.bind("tcp://*:7777");
-        std::cout << "[ZMQ Server] Started on port 7777. Waiting for Android..." << std::endl;
+        cout << "[ZMQ Server] Started on port 7777. Waiting for Android..." << endl;
     }
     catch (const zmq::error_t &e)
     {
-        std::cerr << "[ZMQ Error] Bind failed: " << e.what() << std::endl;
+        cerr << "[ZMQ Error] Bind failed: " << e.what() << endl;
         return;
     }
 
@@ -327,7 +395,7 @@ void run_server(PGconn *db_con)
     {
         if (!start_server)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            this_thread::sleep_for(chrono::milliseconds(100));
             continue;
         }
 
@@ -336,17 +404,17 @@ void run_server(PGconn *db_con)
 
         if (result)
         {
-            std::string msg_str(static_cast<char *>(request.data()), request.size());
-            std::cout << "[ZMQ] Received packet (" << msg_str.length() << " bytes)" << std::endl;
+            string msg_str(static_cast<char *>(request.data()), request.size());
+            cout << "[ZMQ] Received packet (" << msg_str.length() << " bytes)" << endl;
 
             try
             {
                 auto j = json::parse(msg_str);
-                std::lock_guard<std::mutex> lock(mtx);
-                data_store.lat = std::to_string(j.value("lat", 0.0));
-                data_store.lon = std::to_string(j.value("lon", 0.0));
-                data_store.alt = std::to_string(j.value("alt", 0.0));
-                data_store.acc = std::to_string(j.value("acc", 0.0));
+                lock_guard<mutex> lock(mtx);
+                data_store.lat = to_string(j.value("lat", 0.0));
+                data_store.lon = to_string(j.value("lon", 0.0));
+                data_store.alt = to_string(j.value("alt", 0.0));
+                data_store.acc = to_string(j.value("acc", 0.0));
                 {
                     if (j.contains("cell_data") && j["cell_data"].contains("cells"))
                     {
@@ -367,7 +435,7 @@ void run_server(PGconn *db_con)
                                     rsrp_val = cell["signal"].value("dbm", -145.0f);
 
                                 data_store.current_rsrp = rsrp_val;
-                                std::string s_rsrp = std::to_string(rsrp_val);
+                                string s_rsrp = to_string(rsrp_val);
                                 const char *params[6] = {
                                     data_store.lat.c_str(),
                                     data_store.lon.c_str(),
@@ -391,17 +459,17 @@ void run_server(PGconn *db_con)
                     flush_to_disk();
                 }
             }
-            catch (const std::exception &e)
+            catch (const exception &e)
             {
-                std::cerr << "[Data Error] Failed to process JSON: " << e.what() << std::endl;
+                cerr << "[Data Error] Failed to process JSON: " << e.what() << endl;
             }
-            socket.send(zmq::buffer(std::string("OK")), zmq::send_flags::none);
+            socket.send(zmq::buffer(string("OK")), zmq::send_flags::none);
             session_data_counter++;
         }
     }
-    std::lock_guard<std::mutex> lock(mtx);
+    lock_guard<mutex> lock(mtx);
     flush_to_disk();
-    std::cout << "[ZMQ Server] Thread stopped." << std::endl;
+    cout << "[ZMQ Server] Thread stopped." << endl;
 }
 
 void ColoredIndicator(const char *label, bool condition, const char *true_text = "ON", const char *false_text = "OFF") // просто прикольная штучка
@@ -425,19 +493,19 @@ void ColoredIndicator(const char *label, bool condition, const char *true_text =
 
 void load_log_file() // загрузка данных из файла json
 {
-    std::lock_guard<std::mutex> lock(mtx);
+    lock_guard<mutex> lock(mtx);
     offline_store.clear();
 
-    std::ifstream file("log.json");
+    ifstream file("log.json");
     if (!file.is_open())
     {
-        std::cerr << "[Error] Could not open log.json for reading." << std::endl;
+        cerr << "[Error] Could not open log.json for reading." << endl;
         return;
     }
 
-    std::string line;
+    string line;
     int line_count = 0;
-    while (std::getline(file, line))
+    while (getline(file, line))
     {
         if (line.empty())
             continue;
@@ -465,18 +533,18 @@ void load_log_file() // загрузка данных из файла json
         }
         catch (const json::parse_error &e)
         {
-            std::cerr << "[JSON Error] Line " << line_count << ": " << e.what() << std::endl;
+            cerr << "[JSON Error] Line " << line_count << ": " << e.what() << endl;
         }
-        catch (const std::out_of_range &e)
+        catch (const out_of_range &e)
         {
-            std::cerr << "[Data Error] Required keys not found at line " << line_count << std::endl;
+            cerr << "[Data Error] Required keys not found at line " << line_count << endl;
         }
     }
 
     if (line_count > 0)
     {
         offline_store.loaded = true;
-        std::cout << "[Info] Loaded " << line_count << " records from log.json" << std::endl;
+        cout << "[Info] Loaded " << line_count << " records from log.json" << endl;
     }
     file.close();
 }
@@ -545,10 +613,10 @@ void run_gui()
             ImPlot::SetupAxisLimits(ImAxis_X1, data_store.history.current_step - 100, data_store.history.current_step, ImGuiCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, -145, -40);
 
-            std::lock_guard<std::mutex> lock(mtx);
+            lock_guard<mutex> lock(mtx);
             for (auto &[pci, y_vec] : data_store.history.streams_y)
             {
-                std::string label = "PCI: " + std::to_string(pci);
+                string label = "PCI: " + to_string(pci);
                 ImPlot::PlotLine(label.c_str(), data_store.history.x.data(), y_vec.data(), (int)y_vec.size());
             }
             ImPlot::EndPlot();
@@ -613,30 +681,30 @@ void run_gui()
                 double diff = mercator_right - mercator_left;
                 if (diff > 0 && diff < 360.0)
                 {
-                    zoom = (int)std::floor(std::log2(360.0 / diff)) + 2;
-                    zoom = std::max(0, std::min(zoom, 19));
+                    zoom = (int)floor(log2(360.0 / diff)) + 2;
+                    zoom = max(0, min(zoom, 19));
                 }
-                int minX = static_cast<int>(std::floor(MercatorXToTileX(mercator_left, zoom)));
-                int minY = static_cast<int>(std::floor(MercatorYToTileY(mercator_top, zoom)));
-                int maxX = static_cast<int>(std::floor(MercatorXToTileX(mercator_right, zoom)));
-                int maxY = static_cast<int>(std::floor(MercatorYToTileY(mercator_bottom, zoom)));
+                int minX = static_cast<int>(floor(MercatorXToTileX(mercator_left, zoom)));
+                int minY = static_cast<int>(floor(MercatorYToTileY(mercator_top, zoom)));
+                int maxX = static_cast<int>(floor(MercatorXToTileX(mercator_right, zoom)));
+                int maxY = static_cast<int>(floor(MercatorYToTileY(mercator_bottom, zoom)));
 
                 int maxTileCount = (1 << zoom) - 1;
-                minX = std::max(0, std::min(minX, maxTileCount));
-                maxX = std::max(0, std::min(maxX, maxTileCount));
-                minY = std::max(0, std::min(minY, maxTileCount));
-                maxY = std::max(0, std::min(maxY, maxTileCount));
+                minX = max(0, min(minX, maxTileCount));
+                maxX = max(0, min(maxX, maxTileCount));
+                minY = max(0, min(minY, maxTileCount));
+                maxY = max(0, min(maxY, maxTileCount));
 
                 // запрашиваем тайлы
                 for (int x = minX; x <= maxX; ++x)
                 {
                     for (int y = minY; y <= maxY; ++y)
                     {
-                        std::string tileId = std::to_string(zoom) + "/" + std::to_string(x) + "/" + std::to_string(y);
+                        string tileId = to_string(zoom) + "/" + to_string(x) + "/" + to_string(y);
 
                         bool needLoad = false;
                         {
-                            std::lock_guard<std::mutex> lock(g_CacheMutex);
+                            lock_guard<mutex> lock(g_CacheMutex);
                             if (g_TileCache.find(tileId) == g_TileCache.end())
                             {
                                 TextureData newTex;
@@ -648,7 +716,7 @@ void run_gui()
 
                         if (needLoad)
                         {
-                            std::lock_guard<std::mutex> lock(g_JobMutex);
+                            lock_guard<mutex> lock(g_JobMutex);
                             TileJob job;
                             job.id = tileId;
                             job.zoom = zoom;
@@ -664,11 +732,11 @@ void run_gui()
                 {
                     for (int y = minY; y <= maxY; ++y)
                     {
-                        std::string tileId = std::to_string(zoom) + "/" + std::to_string(x) + "/" + std::to_string(y);
+                        string tileId = to_string(zoom) + "/" + to_string(x) + "/" + to_string(y);
 
                         GLuint gpuId = 0;
                         {
-                            std::lock_guard<std::mutex> lock(g_CacheMutex);
+                            lock_guard<mutex> lock(g_CacheMutex);
                             auto it = g_TileCache.find(tileId);
                             if (it != g_TileCache.end())
                             {
@@ -744,18 +812,18 @@ int main()
     con = PQconnectdb(info); // Выполняем SQL-запрос из переменной info
     if (PQstatus(con) != CONNECTION_OK)
     { // если подключение не удалось пишем ошибку
-        std::cerr << "\033[31mОШИБКА\033[0m подключения к БД.\n"
+        cerr << "\033[31mОШИБКА\033[0m подключения к БД.\n"
                   << PQerrorMessage(con) << "\n";
         PQfinish(con); // рвём подключение перед выходом
         exit(1);
     }
     else
     {
-        std::cout << "Подключение \033[32mУСПЕШНО!\033[0m\n\n"
-                  << std::endl;
+        cout << "Подключение \033[32mУСПЕШНО!\033[0m\n\n"
+                  << endl;
     }
-    std::thread(FetchWorker).detach();
-    std::thread server(run_server, con);
+    thread(FetchWorker).detach();
+    thread server(run_server, con);
     run_gui();
     server.join();
     return 0;
