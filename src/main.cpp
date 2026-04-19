@@ -8,6 +8,9 @@
 #include <ctime>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cmath>
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb/stb_image.h>
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
@@ -18,6 +21,8 @@
 #include "backends/imgui_impl_sdl2.h"
 
 #include <libpq-fe.h>
+#include <queue>
+#include <curl/curl.h>
 
 #define HOST "localhost"
 #define PORT "5433"
@@ -26,8 +31,70 @@
 #define DB_USER_PASSWORD "somepassword"
 
 using json = nlohmann::json;
+int zoom = 1;
+// математические приколы для преобразования долготы и широты в координатную плоскость
+double MercatorXToTileX(double mercatorX, int zoom)
+{
+    return (0.5 + mercatorX / 360.0) * (1 << zoom);
+}
 
-struct SignalHistory
+double MercatorYToTileY(double mercatorY, int zoom)
+{
+    return (0.5 - mercatorY / 360.0) * (1 << zoom);
+}
+
+// обратный MercatorXToTileX
+double TileXToMercatorX(int tileX, int zoom)
+{
+    return (tileX / static_cast<double>(1 << zoom) - 0.5) * 360.0;
+}
+
+// обратная функция MercatorYToTileY
+double TileYToMercatorY(int tileY, int zoom)
+{
+    return (0.5 - tileY / static_cast<double>(1 << zoom)) * 360.0;
+}
+
+double LatToMercatorY(double lat)
+{
+    lat = std::max(-85.0511, std::min(85.0511, lat));
+    double lat_rad = lat * M_PI / 180.0;
+    double mercator_y = log(tan(M_PI / 4 + lat_rad / 2));
+    return mercator_y * 180.0 / M_PI;
+}
+
+double MercatorYToLat(double mercator_y)
+{
+    double mercator_y_rad = mercator_y * M_PI / 180.0;
+    double lat_rad = atan(sinh(mercator_y_rad));
+    return lat_rad * 180.0 / M_PI;
+}
+
+struct TileJob
+{
+    std::string id; // строковый идентификатор "zoom/x/y"
+    int zoom;
+    int x;
+    int y;
+};
+
+struct TextureData
+{
+    GLuint id = 0;                 // id текстуры в GPU
+    bool isLoading = false;        // идет загрузка или нет
+    std::vector<uint8_t> rgbaBlob; // пиксели в ОЗУ (до переноса в GPU)
+    int width = 0;
+    int height = 0;
+};
+
+std::map<std::string, TextureData> g_TileCache; // кэш текстур, мапа для сопоставления тайла и его индентификатора
+std::queue<TileJob> g_JobQueue;                 // очередь на загрузку
+
+// мьютексы
+std::mutex g_JobMutex;
+std::mutex g_CacheMutex;
+
+struct SignalHistory // используется для отображения данных о вышках
 {
     std::map<int, std::vector<float>> streams_y;
     std::vector<float> x;
@@ -74,7 +141,7 @@ struct SignalHistory
     }
 };
 
-struct OfflineData
+struct OfflineData // для отображения данных ищ файла
 {
     std::vector<double> lats;
     std::vector<double> lons;
@@ -95,7 +162,7 @@ struct OfflineData
     }
 } offline_store;
 
-struct Telemetry
+struct Telemetry // основная структура данных
 {
     std::string lat = "0", lon = "0", alt = "0", acc = "0", type = "N/A";
     float current_rsrp = -140.0f;
@@ -115,7 +182,7 @@ bool get_network = true;
 // переменные по приколу
 int session_data_counter = 0;
 
-void flush_to_disk()
+void flush_to_disk() // запись данных на диск
 {
     if (data_store.pending_records.empty())
         return;
@@ -129,7 +196,90 @@ void flush_to_disk()
     data_store.pending_records.clear();
 }
 
-bool save_data_to_db(const char *req_data[], PGconn *con)
+// callback из примера
+size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t realsize = size * nmemb;
+    auto &buffer = *static_cast<std::vector<uint8_t> *>(userp);
+    const auto *dataptr = static_cast<uint8_t *>(contents);
+    buffer.insert(buffer.end(), dataptr, dataptr + realsize);
+    return realsize;
+}
+
+void FetchWorker()
+{
+    CURL *curl = curl_easy_init();
+    if (!curl)
+        return;
+
+    // настройки курлы
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "curl");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2);
+
+    while (true)
+    {
+        TileJob job;
+        bool foundJob = false;
+
+        // берем задачу
+        g_JobMutex.lock();
+        if (!g_JobQueue.empty())
+        {
+            job = g_JobQueue.front();
+            g_JobQueue.pop();
+            foundJob = true;
+        }
+        g_JobMutex.unlock();
+
+        if (!foundJob)
+        {
+            SDL_Delay(10);
+            continue;
+        }
+
+        // грузим тайл
+        std::vector<uint8_t> rawBlob;
+        std::string url = "https://a.tile.openstreetmap.org/" + std::to_string(job.zoom) + "/" + std::to_string(job.x) + "/" + std::to_string(job.y) + ".png";
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rawBlob);
+
+        if (curl_easy_perform(curl) == CURLE_OK)
+        {
+            int w, h, ch;
+            unsigned char *data = stbi_load_from_memory(rawBlob.data(), (int)rawBlob.size(), &w, &h, &ch, STBI_rgb_alpha);
+
+            if (data)
+            {
+                g_CacheMutex.lock();
+                if (g_TileCache.count(job.id))
+                {
+                    g_TileCache[job.id].rgbaBlob.assign(data, data + (w * h * 4));
+                    g_TileCache[job.id].width = w;
+                    g_TileCache[job.id].height = h;
+                    g_TileCache[job.id].isLoading = false;
+                }
+                g_CacheMutex.unlock();
+
+                stbi_image_free(data);
+            }
+        }
+        else
+        {
+            g_CacheMutex.lock();
+            if (g_TileCache.count(job.id))
+            {
+                g_TileCache[job.id].isLoading = false;
+            }
+            g_CacheMutex.unlock();
+        }
+    }
+
+    curl_easy_cleanup(curl);
+}
+
+bool save_data_to_db(const char *req_data[], PGconn *con) // сохранение данных в бд
 {
     std::string query = "INSERT INTO network_logs "
                         "(latitude, longitude, altitude, accuracy, network_type, rsrp) "
@@ -254,7 +404,7 @@ void run_server(PGconn *db_con)
     std::cout << "[ZMQ Server] Thread stopped." << std::endl;
 }
 
-void ColoredIndicator(const char *label, bool condition, const char *true_text = "ON", const char *false_text = "OFF")
+void ColoredIndicator(const char *label, bool condition, const char *true_text = "ON", const char *false_text = "OFF") // просто прикольная штучка
 {
     ImGui::Text("%s: ", label);
     ImGui::SameLine();
@@ -273,7 +423,7 @@ void ColoredIndicator(const char *label, bool condition, const char *true_text =
     }
 }
 
-void load_log_file()
+void load_log_file() // загрузка данных из файла json
 {
     std::lock_guard<std::mutex> lock(mtx);
     offline_store.clear();
@@ -451,17 +601,117 @@ void run_gui()
         {
             if (ImPlot::BeginPlot("Map", ImVec2(-1, -1)))
             {
-                // Lon - по X, Lat - по Y
                 ImPlot::SetupAxes("Longitude", "Latitude");
                 ImPlot::SetupAxisLimits(ImAxis_X1, 82.900, 82.960, ImGuiCond_Once);
                 ImPlot::SetupAxisLimits(ImAxis_Y1, 55.000, 55.040, ImGuiCond_Once);
 
-                // Рисуем линию перемещения
+                ImPlotRect limits = ImPlot::GetPlotLimits();
+                double mercator_left = limits.X.Min;
+                double mercator_right = limits.X.Max;
+                double mercator_bottom = LatToMercatorY(limits.Y.Min);
+                double mercator_top = LatToMercatorY(limits.Y.Max);
+                double diff = mercator_right - mercator_left;
+                if (diff > 0 && diff < 360.0)
+                {
+                    zoom = (int)std::floor(std::log2(360.0 / diff)) + 2;
+                    zoom = std::max(0, std::min(zoom, 19));
+                }
+                int minX = static_cast<int>(std::floor(MercatorXToTileX(mercator_left, zoom)));
+                int minY = static_cast<int>(std::floor(MercatorYToTileY(mercator_top, zoom)));
+                int maxX = static_cast<int>(std::floor(MercatorXToTileX(mercator_right, zoom)));
+                int maxY = static_cast<int>(std::floor(MercatorYToTileY(mercator_bottom, zoom)));
+
+                int maxTileCount = (1 << zoom) - 1;
+                minX = std::max(0, std::min(minX, maxTileCount));
+                maxX = std::max(0, std::min(maxX, maxTileCount));
+                minY = std::max(0, std::min(minY, maxTileCount));
+                maxY = std::max(0, std::min(maxY, maxTileCount));
+
+                // запрашиваем тайлы
+                for (int x = minX; x <= maxX; ++x)
+                {
+                    for (int y = minY; y <= maxY; ++y)
+                    {
+                        std::string tileId = std::to_string(zoom) + "/" + std::to_string(x) + "/" + std::to_string(y);
+
+                        bool needLoad = false;
+                        {
+                            std::lock_guard<std::mutex> lock(g_CacheMutex);
+                            if (g_TileCache.find(tileId) == g_TileCache.end())
+                            {
+                                TextureData newTex;
+                                newTex.isLoading = true;
+                                g_TileCache[tileId] = newTex;
+                                needLoad = true;
+                            }
+                        }
+
+                        if (needLoad)
+                        {
+                            std::lock_guard<std::mutex> lock(g_JobMutex);
+                            TileJob job;
+                            job.id = tileId;
+                            job.zoom = zoom;
+                            job.x = x;
+                            job.y = y;
+                            g_JobQueue.push(job);
+                        }
+                    }
+                }
+
+                // отрисовка тайлов
+                for (int x = minX; x <= maxX; ++x)
+                {
+                    for (int y = minY; y <= maxY; ++y)
+                    {
+                        std::string tileId = std::to_string(zoom) + "/" + std::to_string(x) + "/" + std::to_string(y);
+
+                        GLuint gpuId = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(g_CacheMutex);
+                            auto it = g_TileCache.find(tileId);
+                            if (it != g_TileCache.end())
+                            {
+                                auto &tex = it->second;
+
+                                if (!tex.rgbaBlob.empty() && tex.id == 0)
+                                {
+                                    glGenTextures(1, &tex.id);
+                                    glBindTexture(GL_TEXTURE_2D, tex.id);
+                                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tex.width, tex.height, 0,
+                                                 GL_RGBA, GL_UNSIGNED_BYTE, tex.rgbaBlob.data());
+                                    tex.rgbaBlob.clear();
+                                }
+                                gpuId = tex.id;
+                            }
+                        }
+
+                        if (gpuId != 0)
+                        {
+                            double left = TileXToMercatorX(x, zoom);
+                            double right = TileXToMercatorX(x + 1, zoom);
+                            double top_mercator = TileYToMercatorY(y, zoom);
+                            double bottom_mercator = TileYToMercatorY(y + 1, zoom);
+                            double top_lat = MercatorYToLat(top_mercator);
+                            double bottom_lat = MercatorYToLat(bottom_mercator);
+
+                            ImPlotPoint minPoint{left, bottom_lat};
+                            ImPlotPoint maxPoint{right, top_lat};
+
+                            ImPlot::PlotImage(("##tile_" + tileId).c_str(), (ImTextureID)(intptr_t)gpuId, minPoint, maxPoint);
+                        }
+                    }
+                }
+
+                // отрисовка маршрута
                 ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 2.0f);
                 ImPlot::PlotScatter("route",
-                                    offline_store.lons.data(), // X
-                                    offline_store.lats.data(), // Y
+                                    offline_store.lons.data(),
+                                    offline_store.lats.data(),
                                     (int)offline_store.lats.size());
+
                 ImPlot::EndPlot();
             }
         }
@@ -504,6 +754,7 @@ int main()
         std::cout << "Подключение \033[32mУСПЕШНО!\033[0m\n\n"
                   << std::endl;
     }
+    std::thread(FetchWorker).detach();
     std::thread server(run_server, con);
     run_gui();
     server.join();
