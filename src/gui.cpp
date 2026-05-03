@@ -2,6 +2,7 @@
 #include "data_structures.h"
 #include "tile_cache.h"
 #include "mercator.h"
+#include "database.h"
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 #include "imgui.h"
@@ -9,7 +10,6 @@
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
 #include <iostream>
-#include <fstream>
 #include <string>
 #include <mutex>
 #include <algorithm>
@@ -38,45 +38,26 @@ void ColoredIndicator(const char* label, bool condition,
     }
 }
 
-void LoadLogFile() {
+bool LoadDataFromDB() {
     std::lock_guard<std::mutex> lock(mtx);
     offline_store.clear();
     
-    std::ifstream file("log.json");
-    if (!file.is_open()) {
-        std::cerr << "[Error] Could not open log.json for reading." << std::endl;
-        return;
+    auto records = LoadHistoryFromDB();
+    
+    if (records.empty()) {
+        return false;
     }
     
-    std::string line;
-    int line_count = 0;
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
-        
-        try {
-            auto j = json::parse(line);
-            offline_store.lats.push_back(j.at("lat").get<double>());
-            offline_store.lons.push_back(j.at("lon").get<double>());
-            offline_store.times.push_back(j.at("time").get<double>());
-            offline_store.indices.push_back(line_count);
-            
-            if (j.contains("cell_data") && j["cell_data"].contains("signal") &&
-                j["cell_data"]["signal"].contains("rsrp")) {
-                offline_store.rsrps.push_back(j["cell_data"]["signal"]["rsrp"].get<double>());
-            } else {
-                offline_store.rsrps.push_back(-145.0);
-            }
-            line_count++;
-        } catch (const std::exception& e) {
-            std::cerr << "[Error] Line " << line_count << ": " << e.what() << std::endl;
-        }
+    for (size_t i = 0; i < records.size(); i++) {
+        offline_store.lats.push_back(records[i].lat);
+        offline_store.lons.push_back(records[i].lon);
+        offline_store.times.push_back(records[i].time_ms);
+        offline_store.indices.push_back(i);
+        offline_store.rsrps.push_back(records[i].rsrp);
     }
     
-    if (line_count > 0) {
-        offline_store.loaded = true;
-        std::cout << "[Info] Loaded " << line_count << " records from log.json" << std::endl;
-    }
-    file.close();
+    offline_store.loaded = true;
+    return true;
 }
 
 void RunGUI() {
@@ -92,6 +73,8 @@ void RunGUI() {
     ImPlot::CreateContext();
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init("#version 330");
+
+    LoadDataFromDB();
     
     while (running) {
         SDL_Event event;
@@ -146,11 +129,11 @@ void RunGUI() {
         ImGui::End();
 
         ImGui::Begin("Log Control");
-        if (ImGui::Button("Load log.json", ImVec2(-1, 40))) {
-            LoadLogFile();
+        if (ImGui::Button("Load from Database", ImVec2(-1, 40))) {
+            LoadDataFromDB();
         }
         if (offline_store.loaded) {
-            ImGui::TextColored(ImVec4(0, 1, 0, 1), "Total: %d records",
+            ImGui::TextColored(ImVec4(0, 1, 0, 1), "Total: %d records from DB",
                              (int)offline_store.lats.size());
         } else {
             ImGui::TextColored(ImVec4(1, 0, 0, 1), "Records not loaded");

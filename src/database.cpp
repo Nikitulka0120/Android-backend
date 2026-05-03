@@ -1,16 +1,22 @@
 #include "database.h"
 #include <iostream>
-
-#define HOST "localhost"
-#define PORT "5433"
-#define DB_NAME "android_backend"
-#define DB_USER "postgres"
-#define DB_USER_PASSWORD "somepassword"
+#include <string>
+#include <cstdlib>
 
 PGconn* ConnectToDatabase() {
-    const char* info = "host=" HOST " port=" PORT " dbname=" DB_NAME 
-                       " user=" DB_USER " password=" DB_USER_PASSWORD;
-    PGconn* con = PQconnectdb(info);
+    const char* host = std::getenv("DB_HOST") ? std::getenv("DB_HOST") : "localhost";
+    const char* port = std::getenv("DB_PORT") ? std::getenv("DB_PORT") : "5433";
+    const char* dbname = std::getenv("DB_NAME") ? std::getenv("DB_NAME") : "android_backend";
+    const char* user = std::getenv("DB_USER") ? std::getenv("DB_USER") : "postgres";
+    const char* password = std::getenv("DB_PASSWORD") ? std::getenv("DB_PASSWORD") : "somepassword";
+    std::string conn_info = 
+        "host=" + std::string(host) + 
+        " port=" + std::string(port) +
+        " dbname=" + std::string(dbname) + 
+        " user=" + std::string(user) + 
+        " password=" + std::string(password);
+
+    PGconn* con = PQconnectdb(conn_info.c_str());
     
     if (PQstatus(con) != CONNECTION_OK) {
         std::cerr << "\033[31mОШИБКА\033[0m подключения к БД.\n"
@@ -44,4 +50,58 @@ bool SaveDataToDB(const char* req_data[], PGconn* con) {
     std::cout << "Данные вставлены \033[32mУСПЕШНО!\033[0m" << std::endl;
     PQclear(insert_res);
     return true;
+}
+
+std::vector<DBRecord> LoadHistoryFromDB() {
+    std::vector<DBRecord> records;
+    
+    PGconn* conn = ConnectToDatabase();
+    if (!conn) {
+        std::cerr << "[Error] Failed to connect to database for loading history" << std::endl;
+        return records;
+    }
+    
+    const char* query = 
+        "SELECT latitude, longitude, altitude, accuracy, network_type, "
+        "rsrp, EXTRACT(EPOCH FROM timestamp) * 1000 as time_ms "
+        "FROM network_logs "
+        "ORDER BY timestamp ASC";
+    
+    PGresult* res = PQexec(conn, query);
+    
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::cerr << "[Error] Failed to load history: " << PQerrorMessage(conn) << std::endl;
+        PQclear(res);
+        DisconnectFromDatabase(conn);
+        return records;
+    }
+    
+    int rows = PQntuples(res);
+    if (rows == 0) {
+        std::cout << "[Info] No records in database" << std::endl;
+        PQclear(res);
+        DisconnectFromDatabase(conn);
+        return records;
+    }
+    
+    records.reserve(rows);
+    
+    for (int i = 0; i < rows; i++) {
+        DBRecord record;
+        record.lat = atof(PQgetvalue(res, i, 0));
+        record.lon = atof(PQgetvalue(res, i, 1));
+        record.alt = PQgetisnull(res, i, 2) ? 0.0 : atof(PQgetvalue(res, i, 2));
+        record.acc = PQgetisnull(res, i, 3) ? 0.0 : atof(PQgetvalue(res, i, 3));
+        record.network_type = PQgetisnull(res, i, 4) ? "UNKNOWN" : PQgetvalue(res, i, 4);
+        record.rsrp = PQgetisnull(res, i, 5) ? -145.0 : atof(PQgetvalue(res, i, 5));
+        record.time_ms = PQgetisnull(res, i, 6) ? 0.0 : atof(PQgetvalue(res, i, 6));
+        
+        records.push_back(std::move(record));
+    }
+    
+    std::cout << "[Info] Loaded " << rows << " records from database" << std::endl;
+    
+    PQclear(res);
+    DisconnectFromDatabase(conn);
+    return records;
 }
