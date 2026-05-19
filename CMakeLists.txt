@@ -55,6 +55,7 @@ set(PROJECT_SOURCES
     ${SRC_DIR}/mercator.cpp
     ${SRC_DIR}/server.cpp
     ${SRC_DIR}/tile_cache.cpp
+    ${SRC_DIR}/HeatmapRenderer.cpp 
 )
 
 add_executable(main ${PROJECT_SOURCES})
@@ -63,6 +64,7 @@ target_include_directories(main PRIVATE
     ${SRC_DIR}
     ${INCLUDE_DIR}
     ${THIRD_PARTY_DIR}
+    ${THIRD_PARTY_DIR}/stb
     ${THIRD_PARTY_DIR}/json/single_include
     ${THIRD_PARTY_DIR}/other_libs
     ${SDL2_INCLUDE_DIRS}

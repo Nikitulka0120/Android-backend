@@ -39,15 +39,18 @@ void SignalHistory::add_points(const json& cells_array) {
     }
 }
 
-void OfflineData::clear() {
+void OfflineData::clear()
+{
     lats.clear();
     lons.clear();
     rsrps.clear();
+    rsrqs.clear();
+    rssis.clear();
+    alts.clear();
     times.clear();
     indices.clear();
     loaded = false;
 }
-
 OfflineData offline_store;
 Telemetry data_store;
 std::mutex mtx;

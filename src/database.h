@@ -13,6 +13,8 @@ struct DBRecord {
     double alt;
     double acc;
     double rsrp;
+    double rsrq;
+    double rssi;
     double time_ms;
     std::string network_type;
 };

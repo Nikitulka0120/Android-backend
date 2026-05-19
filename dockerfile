@@ -21,7 +21,9 @@ COPY . .
 
 RUN mkdir -p /app/third_party/stb && \
     wget -O /app/third_party/stb/stb_image.h \
-    https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
+    https://raw.githubusercontent.com/nothings/stb/master/stb_image.h && \
+    wget -O /app/third_party/stb/stb_image_write.h \
+    https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h
 
 RUN rm -rf build && mkdir build && cd build \
     && cmake .. -DCMAKE_BUILD_TYPE=Release \
