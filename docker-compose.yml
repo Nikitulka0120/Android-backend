@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: notes_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: android_backend
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: somepassword
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d android_backend"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: notes_app
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: localhost
+      DB_PORT: "5434"
+      DB_NAME: android_backend
+      DB_USER: postgres
+      DB_PASSWORD: somepassword
+      DISPLAY: ${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    network_mode: host
+volumes:
+  postgres_data:
