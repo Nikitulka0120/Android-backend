@@ -3,11 +3,12 @@
 #include <vector>
 #include <string>
 
-PGconn* ConnectToDatabase();
-void DisconnectFromDatabase(PGconn* conn);
-bool SaveDataToDB(const char* req_data[], PGconn* con);
+PGconn *ConnectToDatabase();
+void DisconnectFromDatabase(PGconn *conn);
+bool SaveDataToDB(const char *req_data[], PGconn *con);
 
-struct DBRecord {
+struct DBRecord  // структура используемая как буфер между базой и offlie_store
+{
     double lat;
     double lon;
     double alt;

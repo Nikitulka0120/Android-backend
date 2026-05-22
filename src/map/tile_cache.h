@@ -6,14 +6,16 @@
 #include <string>
 #include <GL/glew.h>
 
-struct TileJob {
+struct TileJob
+{
     std::string id;
     int zoom;
     int x;
     int y;
 };
 
-struct TextureData {
+struct TextureData
+{
     GLuint id = 0;
     bool isLoading = false;
     bool isLoaded = false;
@@ -27,8 +29,8 @@ extern std::queue<TileJob> g_JobQueue;
 extern std::mutex g_JobMutex;
 extern std::mutex g_CacheMutex;
 
-void FetchWorker();
+void TileWorker();
 std::string GetTilePath(int zoom, int x, int y);
-bool LoadTileFromDisk(int zoom, int x, int y, std::vector<uint8_t>& out_data);
-void SaveTileToDisk(int zoom, int x, int y, const std::vector<uint8_t>& data);
-size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp);
+bool LoadTileFromDisk(int zoom, int x, int y, std::vector<uint8_t> &out_data);
+void SaveTileToDisk(int zoom, int x, int y, const std::vector<uint8_t> &data);
+size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp);

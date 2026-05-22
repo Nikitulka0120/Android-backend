@@ -13,27 +13,28 @@
 #include <string>
 #include <mutex>
 #include <algorithm>
-#include "HeatmapRenderer.h"
+#include "heatmap_render.h"
 
-extern bool running;
+extern bool running;                 // заготовка под будущие фильтры передачи
 extern bool start_server;
 extern bool get_location;
 extern bool get_network;
-extern int zoom;
+
+extern int zoom;                    // переменные и мьютексы для тайлов
 extern std::mutex g_CacheMutex;
 extern std::mutex g_JobMutex;
 
 HeatmapRenderer g_HeatmapRenderer;
-constexpr int MODE_RSRP = 0;
+constexpr int MODE_RSRP = 0;       // переключение режимов отрисовки heatmap
 constexpr int MODE_RSRQ = 1;
 constexpr int MODE_RSSI = 2;
 constexpr int MODE_ALT = 3;
 int mode = MODE_RSRP;
 
-static float maxRadius = 60.0f;
+static float max_radius = 60.0f;    // настройки heatmap
 static float idwPower = 3.0f;
 
-const std::vector<double> &GetCurrentModeData()
+const std::vector<double> &GetCurrentModeData() // определение режима отрисовки heatmap
 {
     switch (mode)
     {
@@ -51,7 +52,8 @@ const std::vector<double> &GetCurrentModeData()
     }
 }
 
-void ColoredIndicator(const char *label, bool condition,
+
+void ColoredIndicator(const char *label, bool condition,                // окошко отображающее статус работы сервера
                       const char *true_text, const char *false_text)
 {
     ImGui::Text("%s: ", label);
@@ -71,7 +73,7 @@ void ColoredIndicator(const char *label, bool condition,
     }
 }
 
-bool LoadDataFromDB()
+bool LoadDataFromDB()                           // выгрузка данных о точках
 {
     std::lock_guard<std::mutex> lock(mtx);
     offline_store.clear();
@@ -98,13 +100,13 @@ bool LoadDataFromDB()
         offline_store.lats,
         offline_store.lons,
         GetCurrentModeData(),
-        maxRadius, idwPower);
+        max_radius, idwPower);
     g_HeatmapRenderer.StartGeneration();
 
     return true;
 }
 
-void RunGUI()
+void RunGUI()      // отрисовка всего интерфейса
 {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0)
         return;
@@ -136,7 +138,7 @@ void RunGUI()
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Current stats");
+        ImGui::Begin("Current stats");                              // окно отображения только полученных данных
         ImGui::Text("Network type: %s", data_store.type.c_str());
         ImGui::Text("RSRP: %.1f dBm", data_store.current_rsrp);
         ImGui::Separator();
@@ -148,25 +150,25 @@ void RunGUI()
         ImGui::Text("Data counter in this session: %d", session_data_counter);
         ImGui::End();
 
-        ImGui::Begin("Filters");
+        ImGui::Begin("Filters");                                    // на данный момент неиспользуемые фильтры передачи
         ImGui::Checkbox("Is running?", &start_server);
         ImGui::Checkbox("Is location?", &get_location);
         ImGui::Checkbox("Is network?", &get_network);
         ImGui::End();
 
-        ImGui::Begin("Status");
+        ImGui::Begin("Status");                                     // окно статуса работающих сервисов
         ColoredIndicator("Server", start_server, "RUNNING", "STOPPED");
         ColoredIndicator("Location", get_location);
         ColoredIndicator("Network", get_network);
         ImGui::End();
 
-        ImGui::Begin("Signal Graph");
+        ImGui::Begin("Signal Graph");                               // окно отображения получаемых данных в реальном времени
         if (ImPlot::BeginPlot("History", ImVec2(-1, -1)))
         {
             ImPlot::SetupAxes("Ticks", "dBm");
             ImPlot::SetupAxisLimits(ImAxis_X1, data_store.history.current_step - 100,
                                     data_store.history.current_step, ImGuiCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -145, -40);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, -120, -40);
 
             std::lock_guard<std::mutex> lock(mtx);
             for (auto &[pci, y_vec] : data_store.history.streams_y)
@@ -180,6 +182,10 @@ void RunGUI()
         ImGui::End();
 
         ImGui::Begin("Log Control");
+        /* 
+        Окно которое раньше использовалось для ручной выгрузки данных из бд, на данный момент практического применнеия нет,
+        в дальнейшем может быть использована для синхронизации данныъ
+        */
         if (ImGui::Button("Load from Database", ImVec2(-1, 40)))
         {
             LoadDataFromDB();
@@ -195,7 +201,7 @@ void RunGUI()
         }
         ImGui::End();
 
-        ImGui::Begin("Full Signal History");
+        ImGui::Begin("Full Signal History");                            // 3 графика построенных по данным из бд: RSRP, RSRQ, RSSI 
         if (offline_store.loaded && !offline_store.rsrps.empty())
         {
             float window_width = ImGui::GetContentRegionAvail().x;
@@ -206,7 +212,7 @@ void RunGUI()
             if (ImPlot::BeginPlot("RSRP History", ImVec2(window_width, plot_height)))
             {
                 ImPlot::SetupAxes("Record Index", "dBm");
-                ImPlot::SetupAxisLimits(ImAxis_Y1, -145, -40);
+                ImPlot::SetupAxisLimits(ImAxis_Y1, -120, -40);
                 ImPlot::SetupAxisLimits(ImAxis_X1, 0, num_records, ImGuiCond_Always);
                 ImPlot::PlotLine("RSRP",
                                  offline_store.indices.data(),
@@ -246,14 +252,19 @@ void RunGUI()
         ImGui::End();
 
         ImGui::Begin("Heatmap Settings");
-
+         
+        /* настройки heatmap, на данный момент используются для
+        переключения режима и отображения статуса генерации, в дальнейшем список настроек буду дополнять
+        */
         ImGui::Text("Status: ");
         ImGui::SameLine();
         if (g_HeatmapRenderer.IsGenerating())
         {
             double time = ImGui::GetTime();
             int dots = (int)(time * 3.0) % 4;
-            const char* dotStr = (dots == 0) ? "" : (dots == 1) ? "." : (dots == 2) ? ".." : "...";
+            const char *dotStr = (dots == 0) ? "" : (dots == 1) ? "."
+                                                : (dots == 2)   ? ".."
+                                                                : "...";
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Generating%s", dotStr);
         }
         else
@@ -276,7 +287,7 @@ void RunGUI()
                 offline_store.lats,
                 offline_store.lons,
                 GetCurrentModeData(),
-                maxRadius, 
+                max_radius,
                 idwPower);
 
             g_HeatmapRenderer.StartGeneration();
@@ -284,7 +295,7 @@ void RunGUI()
 
         ImGui::End();
 
-        ImGui::Begin("Movement Route");
+        ImGui::Begin("Movement Route");                             // главная карта с отображением маршрута, тайлов, heatmap'a
         if (offline_store.loaded && !offline_store.lats.empty())
         {
             if (ImPlot::BeginPlot("Map", ImVec2(-1, -1)))
@@ -388,7 +399,7 @@ void RunGUI()
                         }
                     }
                 }
-                g_HeatmapRenderer.UI_DrawOverlay();
+                g_HeatmapRenderer.UIDrawOverlay();
 
                 const auto &currentValues = GetCurrentModeData();
 
@@ -536,7 +547,7 @@ void RunGUI()
         }
         ImGui::End();
 
-        ImGui::Begin("Signal Legend");
+        ImGui::Begin("Signal Legend");                              // красивая легенда heatmap с градиентом
         if (offline_store.loaded && !offline_store.lats.empty())
         {
             const auto &currentValues = GetCurrentModeData();

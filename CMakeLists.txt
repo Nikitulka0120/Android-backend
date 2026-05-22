@@ -48,21 +48,25 @@ target_compile_options(implot PRIVATE -fPIC)
 
 
 set(PROJECT_SOURCES
-    ${SRC_DIR}/main.cpp
-    ${SRC_DIR}/data_structures.cpp
-    ${SRC_DIR}/database.cpp
-    ${SRC_DIR}/gui.cpp
-    ${SRC_DIR}/mercator.cpp
-    ${SRC_DIR}/server.cpp
-    ${SRC_DIR}/tile_cache.cpp
-    ${SRC_DIR}/HeatmapRenderer.cpp 
+    ${SRC_DIR}/core/main.cpp
+    ${SRC_DIR}/core/data_structures.cpp
+    ${SRC_DIR}/database/database.cpp
+    ${SRC_DIR}/gui/gui.cpp
+    ${SRC_DIR}/map/heatmap_render.cpp
+    ${SRC_DIR}/map/mercator.cpp
+    ${SRC_DIR}/map/tile_cache.cpp
+    ${SRC_DIR}/network/server.cpp
 )
 
 add_executable(main ${PROJECT_SOURCES})
 
-target_include_directories(main PRIVATE 
+target_include_directories(main PRIVATE
     ${SRC_DIR}
-    ${INCLUDE_DIR}
+    ${SRC_DIR}/core
+    ${SRC_DIR}/database
+    ${SRC_DIR}/gui
+    ${SRC_DIR}/map
+    ${SRC_DIR}/network
     ${THIRD_PARTY_DIR}
     ${THIRD_PARTY_DIR}/stb
     ${THIRD_PARTY_DIR}/json/single_include

@@ -7,16 +7,16 @@
 
 using json = nlohmann::json;
 
-struct SignalHistory
+struct SignalHistory                   // cтруктура для хранения истории измерений сигнала сотовых вышек
 {
     std::map<int, std::vector<float>> streams_y;
     std::vector<float> x;
     float current_step = 0;
     const int max_points = 200;
-    void add_points(const json &cells_array);
+    void AddPoints(const json &cells_array);
 };
 
-struct OfflineData
+struct OfflineData                      // структура точек которые выгружаются из бд
 {
     std::vector<double> lats;
     std::vector<double> lons;
@@ -33,7 +33,7 @@ struct OfflineData
 struct Telemetry
 {
     std::string lat = "0", lon = "0", alt = "0", acc = "0", type = "N/A";
-    float current_rsrp = -140.0f;
+    float current_rsrp = -120.0f;
     float current_rsrq = -30.0f;
     float current_rssi = -120.0f;
     SignalHistory history;

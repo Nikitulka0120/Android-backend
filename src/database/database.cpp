@@ -3,7 +3,7 @@
 #include <string>
 #include <cstdlib>
 
-PGconn *ConnectToDatabase()
+PGconn *ConnectToDatabase()    // подключение к базе данных
 {
     const char *host = std::getenv("DB_HOST") ? std::getenv("DB_HOST") : "localhost";
     const char *port = std::getenv("DB_PORT") ? std::getenv("DB_PORT") : "5433";
@@ -32,13 +32,13 @@ PGconn *ConnectToDatabase()
     return con;
 }
 
-void DisconnectFromDatabase(PGconn *conn)
+void DisconnectFromDatabase(PGconn *conn)   // разрыв соединения с базой данных
 {
     if (conn)
         PQfinish(conn);
 }
 
-bool SaveDataToDB(const char *req_data[], PGconn *con)
+bool SaveDataToDB(const char *req_data[], PGconn *con)  // запрос на добавление данных в бд, используется при получении данныых с телефона
 {
     std::string query =
         "INSERT INTO network_logs "
@@ -61,7 +61,7 @@ bool SaveDataToDB(const char *req_data[], PGconn *con)
     return true;
 }
 
-std::vector<DBRecord> LoadHistoryFromDB()
+std::vector<DBRecord> LoadHistoryFromDB()   // просто выгрузка всей базы для построения графиков и карты
 {
     std::vector<DBRecord> records;
 
@@ -75,7 +75,7 @@ std::vector<DBRecord> LoadHistoryFromDB()
     const char *query =
         "SELECT latitude, longitude, altitude, accuracy, network_type, rsrp, rsrq, rssi,"
         "EXTRACT(EPOCH FROM timestamp) * 1000 as time_ms "
-        "FROM network_logs WHERE rsrp BETWEEN -200 AND 0 "
+        "FROM network_logs WHERE rsrp BETWEEN -200 AND 0 " // добавил ограничение прямо в запрос по rsrp чтобы отсекать битые данные
         "ORDER BY timestamp ASC";
 
     PGresult *res = PQexec(conn, query);
@@ -108,7 +108,7 @@ std::vector<DBRecord> LoadHistoryFromDB()
         record.acc = PQgetisnull(res, i, 3) ? 0.0 : atof(PQgetvalue(res, i, 3));
         record.network_type = PQgetisnull(res, i, 4) ? "UNKNOWN" : PQgetvalue(res, i, 4);
         record.rsrp = PQgetisnull(res, i, 5)
-                          ? -145.0
+                          ? -120.0
                           : atof(PQgetvalue(res, i, 5));
         record.rsrq = PQgetisnull(res, i, 6)
                           ? -20.0

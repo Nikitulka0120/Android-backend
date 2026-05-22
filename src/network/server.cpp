@@ -15,7 +15,7 @@ bool start_server = true;
 bool get_location = true;
 bool get_network = true;
 
-void FlushToDisk()
+void FlushToDisk()                              // запись полученныъ данных в json
 {
     if (data_store.pending_records.empty())
         return;
@@ -30,7 +30,7 @@ void FlushToDisk()
     data_store.pending_records.clear();
 }
 
-void RunServer(PGconn *db_con)
+void RunServer(PGconn *db_con)                  // запуск сервера на прием данных от приложения
 {
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::rep);
@@ -75,7 +75,7 @@ void RunServer(PGconn *db_con)
                 if (j.contains("cell_data") && j["cell_data"].contains("cells"))
                 {
                     auto &cells = j["cell_data"]["cells"];
-                    data_store.history.add_points(cells);
+                    data_store.history.AddPoints(cells);
 
                     for (auto &cell : cells)
                     {
@@ -83,18 +83,18 @@ void RunServer(PGconn *db_con)
                         {
                             data_store.type = cell.value("type", "N/A");
 
-                            float rsrp_val = -145.0f;
+                            float rsrp_val = -120.0f;
                             float rsrq_val = -30.0f;
                             float rssi_val = -120.0f;
                             if (data_store.type == "LTE")
                             {
-                                rsrp_val = cell["signal"].value("rsrp", -145.0f);
+                                rsrp_val = cell["signal"].value("rsrp", -120.0f);
                                 rsrq_val = cell["signal"].value("rsrq", -30.0f);
                                 rssi_val = cell["signal"].value("rssi", -120.0f);
                             }
                             else if (data_store.type == "NR")
                             {
-                                rsrp_val = cell["signal"].value("ssRsrp", -145.0f);
+                                rsrp_val = cell["signal"].value("ssRsrp", -120.0f);
                                 rsrq_val = cell["signal"].value("ssRsrq", -30.0f);
                                 rssi_val = cell["signal"].value("ssRssi", -120.0f);
                             }
