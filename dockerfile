@@ -14,20 +14,19 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     git \
     wget \
+    nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
 
 RUN mkdir -p /app/third_party/stb && \
-    wget -O /app/third_party/stb/stb_image.h \
-    https://raw.githubusercontent.com/nothings/stb/master/stb_image.h && \
-    wget -O /app/third_party/stb/stb_image_write.h \
-    https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h
+    wget -O /app/third_party/stb/stb_image.h https://raw.githubusercontent.com/nothings/stb/master/stb_image.h && \
+    wget -O /app/third_party/stb/stb_image_write.h https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h
 
-RUN rm -rf build && mkdir build && cd build \
-    && cmake .. -DCMAKE_BUILD_TYPE=Release \
-    && make -j$(nproc)
+RUN rm -rf build && mkdir build && cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    make -j$(nproc)
 
 FROM ubuntu:22.04
 
@@ -42,13 +41,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglx0 \
     libopengl0 \
-    libglx-mesa0 \
     libegl1 \
     libdrm2 \
     libx11-6 \
     libxcb1 \
-    libxau6 \
-    libxdmcp6 \
     libxext6 \
     libxfixes3 \
     libxrender1 \
